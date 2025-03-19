@@ -214,7 +214,7 @@ async function scheduleAnalysis(job: () => Promise<{ markdown: string, inputToke
       globalInputTokens = 0;
       globalOutputTokens = 0;
     }
-    if (globalInputTokens < CONFIG.RATE_LIMITS.INPUT_TOKENS_PER_MINUTE && globalOutputTokens < CONFIG.RATE_LIMITS.OUTPUT_TOKENS_PER_MINUTE) {
+    if (globalInputTokens < CONFIG.RATE_LIMITS.INPUT_TOKENS_PER_MINUTE && globalOutputTokens <= CONFIG.RATE_LIMITS.OUTPUT_TOKENS_PER_MINUTE - 400) {
       try {
         const result = await concurrencyLimiter.schedule(() => job());
         globalInputTokens += result.inputTokens;
