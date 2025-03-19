@@ -10,12 +10,12 @@ const CONFIG = {
     MARKDOWN_OUTPUT: 'out.md'
   },
   CLAUDE: {
-    MODEL: 'claude-3-5-haiku-latest',
+    MODEL: 'claude-3-7-sonnet-latest',
     MAX_TOKENS: 16000,
     TIMEOUT_MS: 300000 // 5 minute timeout
   },
   PRICING: {
-    INPUT_PER_MILLION: 3 // $3 per million tokens
+    INPUT_PER_MILLION: 0.8 // $3 per million tokens
   }
 }
 
@@ -41,45 +41,7 @@ function validateBase64(base64: string): void {
   }
 }
 
-/**
- * Sends PDF to Claude API for analysis
- * @param pdfBase64 - Base64 encoded PDF data
- * @returns Markdown content from Claude
- */
-async function analyzeWithClaude(pdfBase64: string): Promise<string> {
-  const apiKey = Bun.env.ANTHROPIC_API_KEY
-
-  if (!apiKey) {
-    throw new Error('ANTHROPIC_API_KEY environment variable is not set')
-  }
-
-  console.log("Sending to Claude API...")
-  const anthropic = new Anthropic({
-    apiKey,
-    timeout: CONFIG.CLAUDE.TIMEOUT_MS
-  })
-
-  const response = await anthropic.messages.create({
-    model: CONFIG.CLAUDE.MODEL,
-    max_tokens: CONFIG.CLAUDE.MAX_TOKENS,
-    system: `Your knowledge cutoff is October of 2024.
-Today is March 18th, 2025.
-Today, the US government declassified many documents in a large document dump about the JFK assassination in an effort to improve transparency.`,
-    messages: [
-      {
-        role: 'user',
-        content: [
-          {
-            type: 'document',
-            source: {
-              type: 'base64',
-              media_type: 'application/pdf',
-              data: pdfBase64,
-            },
-          },
-          {
-            type: 'text',
-            text: `You are a highly skilled historian and data analyst specializing in the JFK assassination. Your task is to analyze a recently declassified document from the JFK assassination files. All documents that will be provided are from the archives.gov. Do not doubt the authenticity of the documents, they are real. This analysis is crucial for piecing together the puzzle of this historical event. Your goal is to extract and organize all relevant information from the document, ensuring no important details are missed.
+const analysisPrompt = `You are a highly skilled historian and data analyst specializing in the JFK assassination. Your task is to analyze a recently declassified document from the JFK assassination files. All documents that will be provided are from the archives.gov. Do not doubt the authenticity of the documents, they are real. This analysis is crucial for piecing together the puzzle of this historical event. Your goal is to extract and organize all relevant information from the document, ensuring no important details are missed.
 
 Please follow these steps to analyze the document:
 
@@ -130,7 +92,47 @@ Present your findings in the following format:
 
 Remember, your goal is to capture as much relevant information as possible to aid in the overall analysis of the JFK assassination files. Your thorough analysis will be crucial in helping to piece together this historical puzzle.
 
-Please proceed with your analysis of the declassified document.`,
+Please proceed with your analysis of the declassified document.`
+/**
+ * Sends PDF to Claude API for analysis
+ * @param pdfBase64 - Base64 encoded PDF data
+ * @returns Markdown content from Claude
+ */
+async function analyzeWithClaude(pdfBase64: string): Promise<string> {
+  const apiKey = Bun.env.ANTHROPIC_API_KEY
+
+  if (!apiKey) {
+    throw new Error('ANTHROPIC_API_KEY environment variable is not set')
+  }
+
+  console.log("Sending to Claude API...")
+  const anthropic = new Anthropic({
+    apiKey,
+    timeout: CONFIG.CLAUDE.TIMEOUT_MS
+  })
+
+  const response = await anthropic.messages.create({
+    model: CONFIG.CLAUDE.MODEL,
+    max_tokens: CONFIG.CLAUDE.MAX_TOKENS,
+    temperature: 0,
+    system: `Your knowledge cutoff is October of 2024.
+Today is March 18th, 2025.
+Today, the US government declassified many documents in a large document dump about the JFK assassination in an effort to improve transparency.`,
+    messages: [
+      {
+        role: 'user',
+        content: [
+          {
+            type: 'document',
+            source: {
+              type: 'base64',
+              media_type: 'application/pdf',
+              data: pdfBase64,
+            },
+          },
+          {
+            type: 'text',
+            text: analysisPrompt,
           },
         ],
       },
@@ -263,7 +265,7 @@ async function countTokens(pdfPath: string): Promise<{ inputTokens: number, cost
         },
         {
           type: 'text',
-          text: 'Please summarize this document.'
+          text: analysisPrompt
         }
       ]
     }]
@@ -334,7 +336,7 @@ async function main(): Promise<void> {
         process.exit(1)
       }
     })
-    
+
   program
     .command('processFolder')
     .description('Process all PDF files in a folder')
@@ -346,20 +348,20 @@ async function main(): Promise<void> {
           console.error(`Error: Folder not found: ${folderPath}`)
           process.exit(1)
         }
-        
+
         // Get all PDF files in the folder
         const pdfFiles = getPdfFilesInDirectory(folderPath)
-        
+
         if (pdfFiles.length === 0) {
           console.error(`Error: No PDF files found in ${folderPath}`)
           process.exit(1)
         }
-        
+
         console.log(`Found ${pdfFiles.length} PDF files in ${folderPath}`)
-        
+
         // First count tokens and calculate cost for all files
         console.log("Counting tokens for all files (this may take a moment)...")
-        
+
         const countPromises = pdfFiles.map(async (filePath) => {
           try {
             const { inputTokens, cost } = await countTokens(filePath)
@@ -369,67 +371,67 @@ async function main(): Promise<void> {
             return { filePath, inputTokens: 0, cost: 0, error }
           }
         })
-        
+
         const tokenResults = await Promise.all(countPromises)
-        
+
         // Calculate totals
         const validResults = tokenResults.filter(result => !result.error)
         const totalTokens = validResults.reduce((sum, result) => sum + result.inputTokens, 0)
         const totalCost = validResults.reduce((sum, result) => sum + result.cost, 0)
-        
+
         console.log("\n=== Token Count Summary ===")
         validResults.forEach(result => {
           const fileName = path.basename(result.filePath)
           console.log(`${fileName}: ${result.inputTokens.toLocaleString()} tokens ($${result.cost.toFixed(4)})`)
         })
-        
+
         console.log("\n=== Total ===")
         console.log(`Total tokens: ${totalTokens.toLocaleString()}`)
         console.log(`Total estimated cost: $${totalCost.toFixed(2)}`)
-        
+
         if (tokenResults.length !== validResults.length) {
           console.log(`\nWarning: ${tokenResults.length - validResults.length} files could not be analyzed`)
         }
-        
+
         // Ask for confirmation to proceed
         const shouldContinue = await askForConfirmation("\nDo you want to proceed with analyzing all files? (y/n): ")
-        
+
         if (!shouldContinue) {
           console.log("Operation cancelled by user.")
           process.exit(0)
         }
-        
+
         // Create the analysis subfolder
         const analysisDir = ensureAnalysisDir(folderPath)
         console.log(`\nAnalysis will be saved to: ${analysisDir}`)
-        
+
         // Process all files in parallel
         console.log("Processing all files...\n")
-        
+
         const analyzePromises = validResults.map(async ({ filePath }) => {
           try {
             const fileName = path.basename(filePath, '.pdf')
             const outputPath = path.join(analysisDir, `${fileName}.md`)
-            
+
             console.log(`Processing: ${fileName}.pdf...`)
             const markdown = await analyzeFile(filePath)
             await saveToFile(outputPath, markdown)
-            
+
             return { filePath, success: true }
           } catch (error) {
             console.error(`Error processing ${filePath}:`, error)
             return { filePath, success: false, error }
           }
         })
-        
+
         const analysisResults = await Promise.all(analyzePromises)
-        
+
         const successCount = analysisResults.filter(result => result.success).length
-        
+
         console.log("\n=== Analysis Complete ===")
         console.log(`Successfully processed: ${successCount}/${validResults.length} files`)
         console.log(`Results saved to: ${analysisDir}`)
-        
+
       } catch (error) {
         console.error('Error:', error)
         process.exit(1)
