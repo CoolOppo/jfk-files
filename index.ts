@@ -328,8 +328,7 @@ async function main(): Promise<void> {
         const estimatedTokenCost = inputTokens + 1100
         console.log(`Estimated token cost for processing: ${estimatedTokenCost}`)
 
-        await tokenLimiter.schedule({ weight: estimatedTokenCost }, () => Promise.resolve());
-        const markdown = await concurrencyLimiter.schedule(() => analyzeFile(pdfPath));
+        const markdown = await concurrencyLimiter.schedule(() => tokenLimiter.schedule({ weight: estimatedTokenCost }, () => analyzeFile(pdfPath)));
 
         // Save markdown to file
         await saveToFile(CONFIG.PATHS.MARKDOWN_OUTPUT, markdown)
@@ -404,12 +403,8 @@ async function main(): Promise<void> {
             console.log(`Skipping: ${fileName}.md already exists.`)
             return Promise.resolve({ filePath, success: true, skipped: true })
           }
-          return (async () => {
-            const { inputTokens } = await countTokens(filePath)
-            const estimatedTokenCost = inputTokens + 1100
-            console.log(`Estimated token cost for ${fileName}: ${estimatedTokenCost}`)
-            await tokenLimiter.schedule({ weight: estimatedTokenCost }, () => Promise.resolve());
-            return concurrencyLimiter.schedule(async () => {
+          return concurrencyLimiter.schedule(() =>
+            tokenLimiter.schedule({ weight: estimatedTokenCost }, async () => {
               try {
                 console.log(`Processing: ${fileName}.pdf...`)
                 const markdown = await analyzeFile(filePath)
@@ -417,11 +412,11 @@ async function main(): Promise<void> {
                 console.log(`Finished processing: ${fileName}.pdf`)
                 return { filePath, success: true }
               } catch (error) {
-                console.error(`Error processing ${filePath}:`, error)
+                console.error(`Error processing ${fileName}.pdf:`, error)
                 return { filePath, success: false, error }
               }
             })
-          })()
+          )
         })
 
         const analysisResults = await Promise.all(analysisPromises)
