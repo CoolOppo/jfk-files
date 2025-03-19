@@ -16,13 +16,13 @@ const CONFIG = {
     TIMEOUT_MS: 300000 // 5 minute timeout
   },
   PRICING: {
-    INPUT_PER_MILLION: 0.8 // $0.80 per million tokens
+    INPUT_PER_MILLION: 3 // $0.80 per million tokens
   },
   RATE_LIMITS: {
     REQUESTS_PER_MINUTE: 4000,
-    INPUT_TOKENS_PER_MINUTE: 400000,
+    INPUT_TOKENS_PER_MINUTE: 200000,
     OUTPUT_TOKENS_PER_MINUTE: 80000,
-    CONCURRENT_REQUESTS: 10 // Conservative default concurrent requests
+    CONCURRENT_REQUESTS: 25 // Conservative default concurrent requests
   }
 }
 
