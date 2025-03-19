@@ -424,20 +424,19 @@ async function main(): Promise<void> {
             console.log(`Skipping: ${fileName}.md already exists.`)
             return Promise.resolve({ filePath, success: true, skipped: true })
           }
-          return concurrencyLimiter.schedule(() =>
-            tokenLimiter.schedule({ weight: estimatedTokenCost }, async () => {
-              try {
-                console.log(`Processing: ${fileName}.pdf...`)
-                const markdown = await analyzeFile(filePath)
-                await saveToFile(outputPath, markdown)
-                console.log(`Finished processing: ${fileName}.pdf`)
-                return { filePath, success: true }
-              } catch (error) {
-                console.error(`Error processing ${fileName}.pdf:`, error)
-                return { filePath, success: false, error }
-              }
+          return scheduleAnalysis(() => analyzeFile(filePath))
+            .then(({ result: markdown, inputTokens, outputTokens }) => {
+              console.log(`Processing: ${fileName}.pdf...`)
+              return saveToFile(outputPath, markdown)
+                .then(() => {
+                  console.log(`Finished processing: ${fileName}.pdf`)
+                  return { filePath, success: true, inputTokens, outputTokens }
+                })
+                .catch((error) => {
+                  console.error(`Error processing ${fileName}.pdf:`, error)
+                  return { filePath, success: false, error }
+                })
             })
-          )
         })
 
         const analysisResults = await Promise.all(analysisPromises)
