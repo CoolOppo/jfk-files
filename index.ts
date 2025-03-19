@@ -528,8 +528,6 @@ async function main(): Promise<void> {
         // Process files with rate limiting
         console.log("Processing all files with rate limiting...\n")
 
-        // Add a batch size option
-        program.option('-b, --batch-size <number>', 'Number of concurrent files to process', (val) => parseInt(val, 10))
         const options = program.opts()
         const batchSize = options.batchSize || CONFIG.RATE_LIMITS.CONCURRENT_REQUESTS
 
