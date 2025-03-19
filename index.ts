@@ -397,7 +397,7 @@ async function main(): Promise<void> {
         const tasksPerMinuteOutput = Math.floor((0.8 * CONFIG.RATE_LIMITS.OUTPUT_TOKENS_PER_MINUTE) / avgOutput)
         let tasksPerMinuteAllowed = Math.min(tasksPerMinuteInput, tasksPerMinuteOutput)
         tasksPerMinuteAllowed = Math.max(tasksPerMinuteAllowed, 1)
-      
+
         analysisLimiter.updateSettings({
           reservoir: tasksPerMinuteAllowed,
           reservoirRefreshAmount: tasksPerMinuteAllowed,
@@ -407,7 +407,7 @@ async function main(): Promise<void> {
 
         console.log(`Estimated average input tokens: ${avgInput.toFixed(2)}`)
         console.log(`Configured analysis throughput: ${tasksPerMinuteAllowed} tasks per minute with max concurrent ${Math.min(CONFIG.RATE_LIMITS.CONCURRENT_REQUESTS, tasksPerMinuteAllowed)}`)
-      
+
         const analysisDir = ensureAnalysisDir(folderPath)
         console.log(`\nAnalysis will be saved to: ${analysisDir}\n`)
 
@@ -432,7 +432,7 @@ async function main(): Promise<void> {
             }
           })
         })
-      
+
         const analysisResults = await Promise.all(analysisPromises)
         const successCount = analysisResults.filter(result => result.success).length
         console.log("\n=== Analysis Complete ===")
