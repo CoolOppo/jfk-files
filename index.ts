@@ -1,20 +1,8 @@
-import puppeteer from 'puppeteer';
 import { Anthropic } from '@anthropic-ai/sdk';
 
 // Configuration constants
 const CONFIG = {
-  PDF: {
-    FORMAT: 'A4',
-    PRINT_BACKGROUND: true,
-    MARGIN: {
-      top: '20px',
-      right: '20px',
-      bottom: '20px',
-      left: '20px'
-    }
-  },
   PATHS: {
-    PDF_OUTPUT: 'output.pdf',
     MARKDOWN_OUTPUT: 'out.md'
   },
   CLAUDE: {
@@ -24,31 +12,6 @@ const CONFIG = {
   }
 };
 
-/**
- * Captures webpage as PDF using Puppeteer
- * @param url - The URL to capture
- * @returns PDF buffer
- */
-async function capturePdf(url: string): Promise<Buffer> {
-  console.log(`Navigating to ${url}...`);
-  
-  const browser = await puppeteer.launch();
-  
-  try {
-    const page = await browser.newPage();
-    console.log("Loading page...");
-    await page.goto(url, { waitUntil: 'networkidle2' });
-    
-    console.log("Generating PDF...");
-    return await page.pdf({ 
-      format: CONFIG.PDF.FORMAT,
-      printBackground: CONFIG.PDF.PRINT_BACKGROUND,
-      margin: CONFIG.PDF.MARGIN
-    });
-  } finally {
-    await browser.close();
-  }
-}
 
 /**
  * Saves buffer data to a file
@@ -130,20 +93,19 @@ async function analyzeWithClaude(pdfBase64: string): Promise<string> {
 }
 
 /**
- * Main process: captures webpage, converts to PDF, and analyzes with Claude
- * @param url - The URL to process
+ * Main process: reads PDF file and analyzes with Claude
+ * @param pdfPath - Path to the PDF file to process
  * @returns Markdown content
  */
-async function captureAndAnalyze(url: string): Promise<string> {
-  // Generate PDF with Puppeteer
-  const pdfBuffer = await capturePdf(url);
-  
-  // Save the PDF locally for debugging
-  await saveToFile(CONFIG.PATHS.PDF_OUTPUT, pdfBuffer);
+async function analyzeFile(pdfPath: string): Promise<string> {
+  // Read PDF file
+  console.log(`Reading PDF file: ${pdfPath}...`);
+  const pdfFile = Bun.file(pdfPath);
+  const pdfBuffer = await pdfFile.arrayBuffer();
   
   // Convert PDF to base64
   const pdfBase64 = Buffer.from(pdfBuffer).toString('base64');
-  console.log(`PDF generated and converted to base64 (${pdfBase64.length} chars)`);
+  console.log(`PDF read and converted to base64 (${pdfBase64.length} chars)`);
   
   // Validate base64
   validateBase64(pdfBase64);
@@ -156,18 +118,19 @@ async function captureAndAnalyze(url: string): Promise<string> {
  * Main function
  */
 async function main(): Promise<void> {
-  const url = Bun.argv[2];
+  const pdfPath = Bun.argv[2];
   
-  if (!url) {
-    console.error('Please provide a URL');
+  if (!pdfPath) {
+    console.error('Please provide a path to a PDF file');
     process.exit(1);
   }
   
   try {
-    const markdown = await captureAndAnalyze(url);
+    const markdown = await analyzeFile(pdfPath);
     
     // Save markdown to file
     await saveToFile(CONFIG.PATHS.MARKDOWN_OUTPUT, markdown);
+    console.log(`Markdown conversion complete. Output saved to ${CONFIG.PATHS.MARKDOWN_OUTPUT}`);
   } catch (error) {
     console.error('Error:', error);
     process.exit(1);
