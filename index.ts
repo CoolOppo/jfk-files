@@ -328,7 +328,8 @@ async function main(): Promise<void> {
         const estimatedTokenCost = inputTokens + 1100
         console.log(`Estimated token cost for processing: ${estimatedTokenCost}`)
 
-        const markdown = await tokenLimiter.schedule({ weight: estimatedTokenCost }, () => concurrencyLimiter.schedule(() => analyzeFile(pdfPath)))
+        await tokenLimiter.schedule({ weight: estimatedTokenCost }, () => Promise.resolve());
+        const markdown = await concurrencyLimiter.schedule(() => analyzeFile(pdfPath));
 
         // Save markdown to file
         await saveToFile(CONFIG.PATHS.MARKDOWN_OUTPUT, markdown)
@@ -407,7 +408,8 @@ async function main(): Promise<void> {
             const { inputTokens } = await countTokens(filePath)
             const estimatedTokenCost = inputTokens + 1100
             console.log(`Estimated token cost for ${fileName}: ${estimatedTokenCost}`)
-            return tokenLimiter.schedule({ weight: estimatedTokenCost }, () => concurrencyLimiter.schedule(async () => {
+            await tokenLimiter.schedule({ weight: estimatedTokenCost }, () => Promise.resolve());
+            return concurrencyLimiter.schedule(async () => {
               try {
                 console.log(`Processing: ${fileName}.pdf...`)
                 const markdown = await analyzeFile(filePath)
@@ -418,7 +420,7 @@ async function main(): Promise<void> {
                 console.error(`Error processing ${filePath}:`, error)
                 return { filePath, success: false, error }
               }
-            }))
+            })
           })()
         })
 
