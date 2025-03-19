@@ -418,7 +418,7 @@ async function main(): Promise<void> {
                 console.error(`Error processing ${filePath}:`, error)
                 return { filePath, success: false, error }
               }
-            })
+            }))
           })()
         })
 
