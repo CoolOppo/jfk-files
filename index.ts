@@ -27,10 +27,16 @@ const CONFIG = {
   }
 }
 
-let analysisLimiter = new Bottleneck({
-  maxConcurrent: CONFIG.RATE_LIMITS.CONCURRENT_REQUESTS,
+let tokenLimiter = new Bottleneck({
+  maxConcurrent: 1000000,  // allow high job weights without blocking
   reservoir: Infinity
 })
+
+let concurrencyLimiter = new Bottleneck({
+  maxConcurrent: CONFIG.RATE_LIMITS.CONCURRENT_REQUESTS
+})
+
+tokenLimiter.chain(concurrencyLimiter)
 
 
 
@@ -323,7 +329,7 @@ async function main(): Promise<void> {
         const estimatedTokenCost = inputTokens + 1100
         console.log(`Estimated token cost for processing: ${estimatedTokenCost}`)
  
-        const markdown = await analysisLimiter.schedule({ weight: estimatedTokenCost }, () => analyzeFile(pdfPath))
+        const markdown = await tokenLimiter.schedule({ weight: estimatedTokenCost }, () => analyzeFile(pdfPath))
  
         // Save markdown to file
         await saveToFile(CONFIG.PATHS.MARKDOWN_OUTPUT, markdown)
@@ -375,11 +381,10 @@ async function main(): Promise<void> {
         console.log(`Found ${pdfFiles.length} PDF files in ${folderPath}`)
 
         const combinedTokenLimit = 0.8 * (CONFIG.RATE_LIMITS.INPUT_TOKENS_PER_MINUTE + CONFIG.RATE_LIMITS.OUTPUT_TOKENS_PER_MINUTE)
-        analysisLimiter.updateSettings({
+        tokenLimiter.updateSettings({
           reservoir: combinedTokenLimit,
           reservoirRefreshAmount: combinedTokenLimit,
-          reservoirRefreshInterval: 60000,
-          maxConcurrent: CONFIG.RATE_LIMITS.CONCURRENT_REQUESTS
+          reservoirRefreshInterval: 60000
         })
         console.log(`Configured analysis throughput: a combined token limit of ${combinedTokenLimit} tokens per minute`)
 
@@ -398,7 +403,7 @@ async function main(): Promise<void> {
             const { inputTokens } = await countTokens(filePath)
             const estimatedTokenCost = inputTokens + 1100
             console.log(`Estimated token cost for ${fileName}: ${estimatedTokenCost}`)
-            return analysisLimiter.schedule({ weight: estimatedTokenCost }, async () => {
+            return tokenLimiter.schedule({ weight: estimatedTokenCost }, async () => {
               try {
                 console.log(`Processing: ${fileName}.pdf...`)
                 const markdown = await analyzeFile(filePath)
