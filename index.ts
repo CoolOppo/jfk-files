@@ -1,5 +1,8 @@
 import { Command } from 'commander'
 import { Anthropic } from '@anthropic-ai/sdk'
+import * as fs from 'fs'
+import * as path from 'path'
+import * as readline from 'readline'
 
 // Configuration constants
 const CONFIG = {
@@ -173,6 +176,50 @@ async function analyzeFile(pdfPath: string): Promise<string> {
 }
 
 /**
+ * Get all PDF files in a directory
+ * @param directoryPath - Path to the directory
+ * @returns Array of PDF file paths
+ */
+function getPdfFilesInDirectory(directoryPath: string): string[] {
+  const files = fs.readdirSync(directoryPath)
+  return files
+    .filter(file => file.toLowerCase().endsWith('.pdf'))
+    .map(file => path.join(directoryPath, file))
+}
+
+/**
+ * Ensure the analysis directory exists
+ * @param baseDir - Base directory path
+ * @returns Path to the analysis directory
+ */
+function ensureAnalysisDir(baseDir: string): string {
+  const analysisDir = path.join(baseDir, 'analysis')
+  if (!fs.existsSync(analysisDir)) {
+    fs.mkdirSync(analysisDir, { recursive: true })
+  }
+  return analysisDir
+}
+
+/**
+ * Ask user for confirmation
+ * @param question - Question to ask
+ * @returns Promise resolving to boolean
+ */
+async function askForConfirmation(question: string): Promise<boolean> {
+  const rl = readline.createInterface({
+    input: process.stdin,
+    output: process.stdout
+  })
+
+  return new Promise((resolve) => {
+    rl.question(question, (answer) => {
+      rl.close()
+      resolve(answer.toLowerCase() === 'y' || answer.toLowerCase() === 'yes')
+    })
+  })
+}
+
+/**
  * Counts tokens in a PDF file using Anthropic API
  * @param pdfPath - Path to the PDF file
  * @returns Token count and cost information
@@ -282,6 +329,107 @@ async function main(): Promise<void> {
         const { inputTokens, cost } = await countTokens(pdfPath)
         console.log(`\nToken count: ${inputTokens.toLocaleString()}`)
         console.log(`Estimated cost: $${cost.toFixed(4)} (at $${CONFIG.PRICING.INPUT_PER_MILLION} per million tokens)`)
+      } catch (error) {
+        console.error('Error:', error)
+        process.exit(1)
+      }
+    })
+    
+  program
+    .command('processFolder')
+    .description('Process all PDF files in a folder')
+    .argument('<folderPath>', 'path to folder containing PDF files')
+    .action(async (folderPath) => {
+      try {
+        // Check if folder exists
+        if (!fs.existsSync(folderPath)) {
+          console.error(`Error: Folder not found: ${folderPath}`)
+          process.exit(1)
+        }
+        
+        // Get all PDF files in the folder
+        const pdfFiles = getPdfFilesInDirectory(folderPath)
+        
+        if (pdfFiles.length === 0) {
+          console.error(`Error: No PDF files found in ${folderPath}`)
+          process.exit(1)
+        }
+        
+        console.log(`Found ${pdfFiles.length} PDF files in ${folderPath}`)
+        
+        // First count tokens and calculate cost for all files
+        console.log("Counting tokens for all files (this may take a moment)...")
+        
+        const countPromises = pdfFiles.map(async (filePath) => {
+          try {
+            const { inputTokens, cost } = await countTokens(filePath)
+            return { filePath, inputTokens, cost }
+          } catch (error) {
+            console.error(`Error counting tokens for ${filePath}:`, error)
+            return { filePath, inputTokens: 0, cost: 0, error }
+          }
+        })
+        
+        const tokenResults = await Promise.all(countPromises)
+        
+        // Calculate totals
+        const validResults = tokenResults.filter(result => !result.error)
+        const totalTokens = validResults.reduce((sum, result) => sum + result.inputTokens, 0)
+        const totalCost = validResults.reduce((sum, result) => sum + result.cost, 0)
+        
+        console.log("\n=== Token Count Summary ===")
+        validResults.forEach(result => {
+          const fileName = path.basename(result.filePath)
+          console.log(`${fileName}: ${result.inputTokens.toLocaleString()} tokens ($${result.cost.toFixed(4)})`)
+        })
+        
+        console.log("\n=== Total ===")
+        console.log(`Total tokens: ${totalTokens.toLocaleString()}`)
+        console.log(`Total estimated cost: $${totalCost.toFixed(2)}`)
+        
+        if (tokenResults.length !== validResults.length) {
+          console.log(`\nWarning: ${tokenResults.length - validResults.length} files could not be analyzed`)
+        }
+        
+        // Ask for confirmation to proceed
+        const shouldContinue = await askForConfirmation("\nDo you want to proceed with analyzing all files? (y/n): ")
+        
+        if (!shouldContinue) {
+          console.log("Operation cancelled by user.")
+          process.exit(0)
+        }
+        
+        // Create the analysis subfolder
+        const analysisDir = ensureAnalysisDir(folderPath)
+        console.log(`\nAnalysis will be saved to: ${analysisDir}`)
+        
+        // Process all files in parallel
+        console.log("Processing all files...\n")
+        
+        const analyzePromises = validResults.map(async ({ filePath }) => {
+          try {
+            const fileName = path.basename(filePath, '.pdf')
+            const outputPath = path.join(analysisDir, `${fileName}.md`)
+            
+            console.log(`Processing: ${fileName}.pdf...`)
+            const markdown = await analyzeFile(filePath)
+            await saveToFile(outputPath, markdown)
+            
+            return { filePath, success: true }
+          } catch (error) {
+            console.error(`Error processing ${filePath}:`, error)
+            return { filePath, success: false, error }
+          }
+        })
+        
+        const analysisResults = await Promise.all(analyzePromises)
+        
+        const successCount = analysisResults.filter(result => result.success).length
+        
+        console.log("\n=== Analysis Complete ===")
+        console.log(`Successfully processed: ${successCount}/${validResults.length} files`)
+        console.log(`Results saved to: ${analysisDir}`)
+        
       } catch (error) {
         console.error('Error:', error)
         process.exit(1)
