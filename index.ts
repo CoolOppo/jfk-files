@@ -373,13 +373,20 @@ async function main(): Promise<void> {
           console.error(`Error: Folder not found: ${folderPath}`)
           process.exit(1)
         }
-        const pdfFiles = getPdfFilesInDirectory(folderPath)
+        const analysisDir = ensureAnalysisDir(folderPath)
+        const allPdfFiles = getPdfFilesInDirectory(folderPath)
+        const pdfFiles = allPdfFiles.filter((filePath) => {
+          const fileName = path.basename(filePath, '.pdf')
+          const outputPath = path.join(analysisDir, `${fileName}.md`)
+          return !fs.existsSync(outputPath)
+        })
+        const numSkipped = allPdfFiles.length - pdfFiles.length;
+        console.log(`Found ${allPdfFiles.length} PDF files in ${folderPath}. Skipping ${numSkipped} already processed files.`)
         if (pdfFiles.length === 0) {
-          console.error(`Error: No PDF files found in ${folderPath}`)
-          process.exit(1)
+          console.log(`All files have already been processed. Nothing to do.`);
+          process.exit(0);
         }
-        console.log(`Found ${pdfFiles.length} PDF files in ${folderPath}`)
-
+        
         const combinedTokenLimit = 0.8 * (CONFIG.RATE_LIMITS.INPUT_TOKENS_PER_MINUTE + CONFIG.RATE_LIMITS.OUTPUT_TOKENS_PER_MINUTE)
         tokenLimiter.updateSettings({
           reservoir: combinedTokenLimit,
@@ -387,8 +394,6 @@ async function main(): Promise<void> {
           reservoirRefreshInterval: 60000
         })
         console.log(`Configured analysis throughput: a combined token limit of ${combinedTokenLimit} tokens per minute`)
-
-        const analysisDir = ensureAnalysisDir(folderPath)
         console.log(`\nAnalysis will be saved to: ${analysisDir}\n`)
 
         // Process all files concurrently using the analysisLimiter with proper token-based weighting
