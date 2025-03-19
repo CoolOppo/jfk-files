@@ -417,6 +417,10 @@ async function main(): Promise<void> {
             try {
               const fileName = path.basename(filePath, '.pdf')
               const outputPath = path.join(analysisDir, `${fileName}.md`)
+              if (fs.existsSync(outputPath)) {
+                console.log(`Skipping: ${fileName}.md already exists.`)
+                return { filePath, success: true, skipped: true }
+              }
               console.log(`Processing: ${fileName}.pdf...`)
               const markdown = await analyzeFile(filePath)
               await saveToFile(outputPath, markdown)
