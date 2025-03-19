@@ -217,7 +217,7 @@ async function analyzeWithClaude(pdfBase64: string): Promise<string> {
 
     // Track request before sending (we don't know token counts yet)
     await rateLimiter.trackRequest()
-    
+
     const response = await anthropic.messages.create({
       model: CONFIG.CLAUDE.MODEL,
       max_tokens: CONFIG.CLAUDE.MAX_TOKENS,
@@ -247,7 +247,7 @@ Today, the US government declassified many documents in a large document dump ab
     })
 
     console.log('Response received from Claude API')
-    
+
     // Track token usage
     const inputTokens = response.usage?.input_tokens || 0
     const outputTokens = response.usage?.output_tokens || 0
@@ -364,10 +364,10 @@ async function countTokens(pdfPath: string): Promise<{ inputTokens: number, cost
     })
 
     console.log("Counting tokens...")
-    
+
     // Track this API request (no output tokens for count endpoint)
     await rateLimiter.trackRequest()
-    
+
     const response = await anthropic.messages.countTokens({
       model: CONFIG.CLAUDE.MODEL,
       messages: [{
@@ -391,9 +391,6 @@ async function countTokens(pdfPath: string): Promise<{ inputTokens: number, cost
 
     const inputTokens = response.input_tokens
     const cost = (inputTokens / 1000000) * CONFIG.PRICING.INPUT_PER_MILLION
-    
-    // Track token usage
-    await rateLimiter.trackRequest(inputTokens, 0)
 
     return { inputTokens, cost }
   })
@@ -530,20 +527,20 @@ async function main(): Promise<void> {
 
         // Process files with rate limiting
         console.log("Processing all files with rate limiting...\n")
-        
+
         // Add a batch size option
         program.option('-b, --batch-size <number>', 'Number of concurrent files to process', (val) => parseInt(val, 10))
         const options = program.opts()
         const batchSize = options.batchSize || CONFIG.RATE_LIMITS.CONCURRENT_REQUESTS
-        
+
         console.log(`Using batch size of ${batchSize} concurrent requests`)
-        
+
         // Process files with controlled concurrency
         const analysisResults = []
         for (let i = 0; i < validResults.length; i += batchSize) {
           const batch = validResults.slice(i, i + batchSize)
           console.log(`Processing batch ${Math.floor(i/batchSize) + 1} of ${Math.ceil(validResults.length/batchSize)}...`)
-          
+
           const batchPromises = batch.map(async ({ filePath }) => {
             try {
               const fileName = path.basename(filePath, '.pdf')
@@ -563,10 +560,10 @@ async function main(): Promise<void> {
               return result
             }
           })
-          
+
           // Wait for current batch to complete before starting next batch
           await Promise.all(batchPromises)
-          
+
           // Display rate limit usage after each batch
           const usage = rateLimiter.getUsagePercentages()
           console.log(`\nCurrent rate limit usage:`)
