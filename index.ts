@@ -320,7 +320,7 @@ async function main(): Promise<void> {
         console.log(`Processing PDF: ${pdfPath}`)
         // Estimate token usage for the file
         const { inputTokens } = await countTokens(pdfPath)
-        const estimatedTokenCost = inputTokens * 1.5
+        const estimatedTokenCost = inputTokens + 1100
         console.log(`Estimated token cost for processing: ${estimatedTokenCost}`)
  
         const markdown = await analysisLimiter.schedule({ weight: estimatedTokenCost }, () => analyzeFile(pdfPath))
@@ -396,7 +396,7 @@ async function main(): Promise<void> {
           }
           return (async () => {
             const { inputTokens } = await countTokens(filePath)
-            const estimatedTokenCost = inputTokens * 1.5
+            const estimatedTokenCost = inputTokens + 1100
             console.log(`Estimated token cost for ${fileName}: ${estimatedTokenCost}`)
             return analysisLimiter.schedule({ weight: estimatedTokenCost }, async () => {
               try {
