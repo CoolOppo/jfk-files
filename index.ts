@@ -4,6 +4,7 @@ import * as fs from 'fs'
 import * as path from 'path'
 import * as readline from 'readline'
 import { setTimeout } from 'timers/promises'
+import Bottleneck from 'bottleneck'
 
 // Configuration constants
 const CONFIG = {
@@ -26,101 +27,11 @@ const CONFIG = {
   }
 }
 
-/**
- * Rate limiter to manage API request rate
- */
-class RateLimiter {
-  private requestCount: number = 0
-  private inputTokenCount: number = 0
-  private outputTokenCount: number = 0
-  private lastResetTime: number = Date.now()
-  private queue: Array<() => Promise<any>> = []
-  private runningTasks: number = 0
-  private maxConcurrent: number
+let analysisLimiter = new Bottleneck({
+  maxConcurrent: CONFIG.RATE_LIMITS.CONCURRENT_REQUESTS,
+  reservoir: Infinity
+})
 
-  constructor(maxConcurrent: number = CONFIG.RATE_LIMITS.CONCURRENT_REQUESTS) {
-    this.maxConcurrent = maxConcurrent
-    // Reset counters every minute
-    setInterval(() => this.resetCounters(), 60000)
-  }
-
-  private resetCounters(): void {
-    this.requestCount = 0
-    this.inputTokenCount = 0
-    this.outputTokenCount = 0
-    this.lastResetTime = Date.now()
-    console.log('Rate limit counters reset')
-  }
-
-  private async processQueue(): Promise<void> {
-    if (this.queue.length === 0 || this.runningTasks >= this.maxConcurrent) {
-      return
-    }
-
-    const task = this.queue.shift()
-    if (!task) return
-
-    this.runningTasks++
-    try {
-      await task()
-    } catch (error) {
-      console.error('Error in queued task:', error)
-    } finally {
-      this.runningTasks--
-      // Process next task
-      this.processQueue()
-    }
-  }
-
-  public async enqueue<T>(task: () => Promise<T>): Promise<T> {
-    return new Promise((resolve, reject) => {
-      this.queue.push(async () => {
-        try {
-          const result = await task()
-          resolve(result)
-        } catch (error) {
-          reject(error)
-        }
-      })
-
-      // Start processing the queue
-      this.processQueue()
-    })
-  }
-
-  public async trackRequest(inputTokens: number = 0, outputTokens: number = 0): Promise<void> {
-    // Check if we're approaching rate limits
-    if (
-      this.requestCount >= CONFIG.RATE_LIMITS.REQUESTS_PER_MINUTE ||
-      this.inputTokenCount + inputTokens >= CONFIG.RATE_LIMITS.INPUT_TOKENS_PER_MINUTE ||
-      this.outputTokenCount + outputTokens >= CONFIG.RATE_LIMITS.OUTPUT_TOKENS_PER_MINUTE
-    ) {
-      // Wait until the next minute reset
-      const timeUntilReset = 60000 - (Date.now() - this.lastResetTime)
-      if (timeUntilReset > 0) {
-        console.log(`Rate limit approaching, waiting ${Math.ceil(timeUntilReset / 1000)} seconds...`)
-        await setTimeout(timeUntilReset)
-      }
-    }
-
-    // Track this request
-    this.requestCount++
-    this.inputTokenCount += inputTokens
-    this.outputTokenCount += outputTokens
-  }
-
-  // Return current usage as percentages of limits
-  public getUsagePercentages(): { requests: number, inputTokens: number, outputTokens: number } {
-    return {
-      requests: (this.requestCount / CONFIG.RATE_LIMITS.REQUESTS_PER_MINUTE) * 100,
-      inputTokens: (this.inputTokenCount / CONFIG.RATE_LIMITS.INPUT_TOKENS_PER_MINUTE) * 100,
-      outputTokens: (this.outputTokenCount / CONFIG.RATE_LIMITS.OUTPUT_TOKENS_PER_MINUTE) * 100
-    }
-  }
-}
-
-// Create a single instance of the rate limiter
-const rateLimiter = new RateLimiter()
 
 
 /**
@@ -202,70 +113,59 @@ Please proceed with your analysis of the declassified document.`
  * @returns Markdown content from Claude
  */
 async function analyzeWithClaude(pdfBase64: string): Promise<string> {
-  return rateLimiter.enqueue(async () => {
-    const apiKey = Bun.env.ANTHROPIC_API_KEY
+  const apiKey = Bun.env.ANTHROPIC_API_KEY
 
-    if (!apiKey) {
-      throw new Error('ANTHROPIC_API_KEY environment variable is not set')
-    }
+  if (!apiKey) {
+    throw new Error('ANTHROPIC_API_KEY environment variable is not set')
+  }
 
-    console.log("Sending to Claude API...")
-    const anthropic = new Anthropic({
-      apiKey,
-      timeout: CONFIG.CLAUDE.TIMEOUT_MS
-    })
+  console.log("Sending to Claude API...")
+  const anthropic = new Anthropic({
+    apiKey,
+    timeout: CONFIG.CLAUDE.TIMEOUT_MS
+  })
 
-    // Track request before sending (we don't know token counts yet)
-    await rateLimiter.trackRequest()
-
-    const response = await anthropic.messages.create({
-      model: CONFIG.CLAUDE.MODEL,
-      max_tokens: CONFIG.CLAUDE.MAX_TOKENS,
-      temperature: 0,
-      system: `Your knowledge cutoff is October of 2024.
+  const response = await anthropic.messages.create({
+    model: CONFIG.CLAUDE.MODEL,
+    max_tokens: CONFIG.CLAUDE.MAX_TOKENS,
+    temperature: 0,
+    system: `Your knowledge cutoff is October of 2024.
 Today is March 18th, 2025.
 Today, the US government declassified many documents in a large document dump about the JFK assassination in an effort to improve transparency.`,
-      messages: [
-        {
-          role: 'user',
-          content: [
-            {
-              type: 'document',
-              source: {
-                type: 'base64',
-                media_type: 'application/pdf',
-                data: pdfBase64,
-              },
+    messages: [
+      {
+        role: 'user',
+        content: [
+          {
+            type: 'document',
+            source: {
+              type: 'base64',
+              media_type: 'application/pdf',
+              data: pdfBase64,
             },
-            {
-              type: 'text',
-              text: analysisPrompt,
-            },
-          ],
-        },
-      ],
-    })
-
-    console.log('Response received from Claude API')
-
-    // Track token usage
-    const inputTokens = response.usage?.input_tokens || 0
-    const outputTokens = response.usage?.output_tokens || 0
-    await rateLimiter.trackRequest(inputTokens, outputTokens)
-
-    // Extract text content
-    let markdownContent = ''
-    if (Array.isArray(response.content)) {
-      for (const item of response.content) {
-        if (item.type === 'text') {
-          markdownContent += item.text
-        }
-      }
-      return markdownContent
-    }
-
-    throw new Error('Unexpected response format from Claude API')
+          },
+          {
+            type: 'text',
+            text: analysisPrompt,
+          },
+        ],
+      },
+    ],
   })
+
+  console.log('Response received from Claude API')
+
+  let markdownContent = ''
+  if (Array.isArray(response.content)) {
+    for (const item of response.content) {
+      if (item.type === 'text') {
+        markdownContent += item.text
+      }
+    }
+    return markdownContent
+  }
+
+  throw new Error('Unexpected response format from Claude API')
 }
 
 /**
@@ -340,60 +240,55 @@ async function askForConfirmation(question: string): Promise<boolean> {
  * @returns Token count and cost information
  */
 async function countTokens(pdfPath: string): Promise<{ inputTokens: number, cost: number }> {
-  return rateLimiter.enqueue(async () => {
-    const apiKey = Bun.env.ANTHROPIC_API_KEY
+  const apiKey = Bun.env.ANTHROPIC_API_KEY
 
-    if (!apiKey) {
-      throw new Error('ANTHROPIC_API_KEY environment variable is not set')
-    }
+  if (!apiKey) {
+    throw new Error('ANTHROPIC_API_KEY environment variable is not set')
+  }
 
-    console.log(`Reading PDF file: ${pdfPath}...`)
-    const pdfFile = Bun.file(pdfPath)
-    const pdfBuffer = await pdfFile.arrayBuffer()
+  console.log(`Reading PDF file: ${pdfPath}...`)
+  const pdfFile = Bun.file(pdfPath)
+  const pdfBuffer = await pdfFile.arrayBuffer()
 
-    // Convert PDF to base64
-    const pdfBase64 = Buffer.from(pdfBuffer).toString('base64')
-    console.log(`PDF read and converted to base64 (${pdfBase64.length} chars)`)
+  // Convert PDF to base64
+  const pdfBase64 = Buffer.from(pdfBuffer).toString('base64')
+  console.log(`PDF read and converted to base64 (${pdfBase64.length} chars)`)
 
-    // Validate base64
-    validateBase64(pdfBase64)
+  // Validate base64
+  validateBase64(pdfBase64)
 
-    const anthropic = new Anthropic({
-      apiKey,
-      timeout: CONFIG.CLAUDE.TIMEOUT_MS
-    })
-
-    console.log("Counting tokens...")
-
-    // Track this API request (no output tokens for count endpoint)
-    await rateLimiter.trackRequest()
-
-    const response = await anthropic.messages.countTokens({
-      model: CONFIG.CLAUDE.MODEL,
-      messages: [{
-        role: 'user',
-        content: [
-          {
-            type: 'document',
-            source: {
-              type: 'base64',
-              media_type: 'application/pdf',
-              data: pdfBase64
-            }
-          },
-          {
-            type: 'text',
-            text: analysisPrompt
-          }
-        ]
-      }]
-    })
-
-    const inputTokens = response.input_tokens
-    const cost = (inputTokens / 1000000) * CONFIG.PRICING.INPUT_PER_MILLION
-
-    return { inputTokens, cost }
+  const anthropic = new Anthropic({
+    apiKey,
+    timeout: CONFIG.CLAUDE.TIMEOUT_MS
   })
+
+  console.log("Counting tokens...")
+
+  const response = await anthropic.messages.countTokens({
+    model: CONFIG.CLAUDE.MODEL,
+    messages: [{
+      role: 'user',
+      content: [
+        {
+          type: 'document',
+          source: {
+            type: 'base64',
+            media_type: 'application/pdf',
+            data: pdfBase64
+          }
+        },
+        {
+          type: 'text',
+          text: analysisPrompt
+        }
+      ]
+    }]
+  })
+
+  const inputTokens = response.input_tokens
+  const cost = (inputTokens / 1000000) * CONFIG.PRICING.INPUT_PER_MILLION
+
+  return { inputTokens, cost }
 }
 
 /**
@@ -423,7 +318,7 @@ async function main(): Promise<void> {
         }
 
         console.log(`Processing PDF: ${pdfPath}`)
-        const markdown = await analyzeFile(pdfPath)
+        const markdown = await analysisLimiter.schedule(() => analyzeFile(pdfPath))
 
         // Save markdown to file
         await saveToFile(CONFIG.PATHS.MARKDOWN_OUTPUT, markdown)
@@ -463,119 +358,82 @@ async function main(): Promise<void> {
     .argument('<folderPath>', 'path to folder containing PDF files')
     .action(async (folderPath) => {
       try {
-        // Check if folder exists
         if (!fs.existsSync(folderPath)) {
           console.error(`Error: Folder not found: ${folderPath}`)
           process.exit(1)
         }
-
-        // Get all PDF files in the folder
         const pdfFiles = getPdfFilesInDirectory(folderPath)
-
         if (pdfFiles.length === 0) {
           console.error(`Error: No PDF files found in ${folderPath}`)
           process.exit(1)
         }
-
         console.log(`Found ${pdfFiles.length} PDF files in ${folderPath}`)
 
-        // First count tokens and calculate cost for all files
-        console.log("Counting tokens for all files (this may take a moment)...")
+        // Sample 20 random documents for token usage estimation
+        const sampleCount = Math.min(20, pdfFiles.length)
+        const shuffled = pdfFiles.sort(() => 0.5 - Math.random())
+        const sampleFiles = shuffled.slice(0, sampleCount)
 
-        const countPromises = pdfFiles.map(async (filePath) => {
+        console.log("Sampling 20 documents for token usage estimation...")
+        const sampleResults = await Promise.all(sampleFiles.map(async (filePath) => {
           try {
-            const { inputTokens, cost } = await countTokens(filePath)
-            return { filePath, inputTokens, cost }
+            const { inputTokens } = await countTokens(filePath)
+            return inputTokens
           } catch (error) {
             console.error(`Error counting tokens for ${filePath}:`, error)
-            return { filePath, inputTokens: 0, cost: 0, error }
+            return 0
           }
+        }))
+
+        const validSamples = sampleResults.filter(t => t > 0)
+        if (validSamples.length === 0) {
+          console.error("Error: Unable to estimate token usage from samples.")
+          process.exit(1)
+        }
+        const avgInput = validSamples.reduce((sum, t) => sum + t, 0) / validSamples.length
+        const avgOutput = avgInput * 0.5 // assume output tokens are half of input tokens
+
+        const tasksPerMinuteInput = Math.floor((0.8 * CONFIG.RATE_LIMITS.INPUT_TOKENS_PER_MINUTE) / avgInput)
+        const tasksPerMinuteOutput = Math.floor((0.8 * CONFIG.RATE_LIMITS.OUTPUT_TOKENS_PER_MINUTE) / avgOutput)
+        let tasksPerMinuteAllowed = Math.min(tasksPerMinuteInput, tasksPerMinuteOutput)
+        tasksPerMinuteAllowed = Math.max(tasksPerMinuteAllowed, 1)
+      
+        analysisLimiter.updateSettings({
+          reservoir: tasksPerMinuteAllowed,
+          reservoirRefreshAmount: tasksPerMinuteAllowed,
+          reservoirRefreshInterval: 60000,
+          maxConcurrent: Math.min(CONFIG.RATE_LIMITS.CONCURRENT_REQUESTS, tasksPerMinuteAllowed)
         })
 
-        const tokenResults = await Promise.all(countPromises)
-
-        // Calculate totals
-        const validResults = tokenResults.filter(result => !result.error)
-        const totalTokens = validResults.reduce((sum, result) => sum + result.inputTokens, 0)
-        const totalCost = validResults.reduce((sum, result) => sum + result.cost, 0)
-
-        console.log("\n=== Token Count Summary ===")
-        validResults.forEach(result => {
-          const fileName = path.basename(result.filePath)
-          console.log(`${fileName}: ${result.inputTokens.toLocaleString()} tokens ($${result.cost.toFixed(4)})`)
-        })
-
-        console.log("\n=== Total ===")
-        console.log(`Total tokens: ${totalTokens.toLocaleString()}`)
-        console.log(`Total estimated cost: $${totalCost.toFixed(2)}`)
-
-        if (tokenResults.length !== validResults.length) {
-          console.log(`\nWarning: ${tokenResults.length - validResults.length} files could not be analyzed`)
-        }
-
-        // Ask for confirmation to proceed
-        const shouldContinue = await askForConfirmation("\nDo you want to proceed with analyzing all files? (y/n): ")
-
-        if (!shouldContinue) {
-          console.log("Operation cancelled by user.")
-          process.exit(0)
-        }
-
-        // Create the analysis subfolder
+        console.log(`Estimated average input tokens: ${avgInput.toFixed(2)}`)
+        console.log(`Configured analysis throughput: ${tasksPerMinuteAllowed} tasks per minute with max concurrent ${Math.min(CONFIG.RATE_LIMITS.CONCURRENT_REQUESTS, tasksPerMinuteAllowed)}`)
+      
         const analysisDir = ensureAnalysisDir(folderPath)
-        console.log(`\nAnalysis will be saved to: ${analysisDir}`)
+        console.log(`\nAnalysis will be saved to: ${analysisDir}\n`)
 
-        // Process files with rate limiting
-        console.log("Processing all files with rate limiting...\n")
-
-        const options = program.opts()
-        const batchSize = options.batchSize || CONFIG.RATE_LIMITS.CONCURRENT_REQUESTS
-
-        console.log(`Using batch size of ${batchSize} concurrent requests`)
-
-        // Process files with controlled concurrency
-        const analysisResults = []
-        for (let i = 0; i < validResults.length; i += batchSize) {
-          const batch = validResults.slice(i, i + batchSize)
-          console.log(`Processing batch ${Math.floor(i/batchSize) + 1} of ${Math.ceil(validResults.length/batchSize)}...`)
-
-          const batchPromises = batch.map(async ({ filePath }) => {
+        // Process all files concurrently using the analysisLimiter
+        const analysisPromises = pdfFiles.map((filePath) => {
+          return analysisLimiter.schedule(async () => {
             try {
               const fileName = path.basename(filePath, '.pdf')
               const outputPath = path.join(analysisDir, `${fileName}.md`)
-
               console.log(`Processing: ${fileName}.pdf...`)
               const markdown = await analyzeFile(filePath)
               await saveToFile(outputPath, markdown)
-
-              const result = { filePath, success: true }
-              analysisResults.push(result)
-              return result
+              console.log(`Finished processing: ${fileName}.pdf`)
+              return { filePath, success: true }
             } catch (error) {
               console.error(`Error processing ${filePath}:`, error)
-              const result = { filePath, success: false, error }
-              analysisResults.push(result)
-              return result
+              return { filePath, success: false, error }
             }
           })
-
-          // Wait for current batch to complete before starting next batch
-          await Promise.all(batchPromises)
-
-          // Display rate limit usage after each batch
-          const usage = rateLimiter.getUsagePercentages()
-          console.log(`\nCurrent rate limit usage:`)
-          console.log(`- Requests: ${usage.requests.toFixed(1)}%`)
-          console.log(`- Input tokens: ${usage.inputTokens.toFixed(1)}%`)
-          console.log(`- Output tokens: ${usage.outputTokens.toFixed(1)}%\n`)
-        }
-
+        })
+      
+        const analysisResults = await Promise.all(analysisPromises)
         const successCount = analysisResults.filter(result => result.success).length
-
         console.log("\n=== Analysis Complete ===")
-        console.log(`Successfully processed: ${successCount}/${validResults.length} files`)
+        console.log(`Successfully processed: ${successCount}/${pdfFiles.length} files`)
         console.log(`Results saved to: ${analysisDir}`)
-
       } catch (error) {
         console.error('Error:', error)
         process.exit(1)
