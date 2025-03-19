@@ -12,8 +12,8 @@ const CONFIG = {
     MARKDOWN_OUTPUT: 'out.md'
   },
   CLAUDE: {
-    MODEL: 'claude-3-7-sonnet-latest',
-    MAX_TOKENS: 16000,
+    MODEL: 'claude-3-5-haiku-latest',
+    MAX_TOKENS: 8192,
     TIMEOUT_MS: 300000 // 5 minute timeout
   },
   PRICING: {
@@ -347,10 +347,10 @@ async function main(): Promise<void> {
           console.error(`Error: File not found: ${pdfPath}`)
           process.exit(1)
         }
- 
+
         console.log(`Processing PDF: ${pdfPath}`)
         const { result: markdown } = await scheduleAnalysis(() => analyzeFile(pdfPath));
- 
+
         // Save markdown to file
         await saveToFile(CONFIG.PATHS.MARKDOWN_OUTPUT, markdown)
         console.log(`Markdown conversion complete. Output saved to ${CONFIG.PATHS.MARKDOWN_OUTPUT}`)
