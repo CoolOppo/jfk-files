@@ -213,17 +213,28 @@ async function scheduleAnalysis(job: () => Promise<{ markdown: string, inputToke
       windowStartTime = now;
       globalInputTokens = 0;
       globalOutputTokens = 0;
-      break;
     }
     if (globalInputTokens < CONFIG.RATE_LIMITS.INPUT_TOKENS_PER_MINUTE && globalOutputTokens < CONFIG.RATE_LIMITS.OUTPUT_TOKENS_PER_MINUTE) {
-      break;
+      try {
+        const result = await concurrencyLimiter.schedule(() => job());
+        globalInputTokens += result.inputTokens;
+        globalOutputTokens += result.outputTokens;
+        return { result: result.markdown, inputTokens: result.inputTokens, outputTokens: result.outputTokens };
+      } catch (error) {
+        if (error?.message && error.message.includes("output") && error.message.includes("rate limit")) {
+          const nowRetry = Date.now();
+          const waitTime = 60000 - (nowRetry - windowStartTime);
+          console.error(`Output token rate limit hit. Waiting ${waitTime}ms before retrying.`);
+          await setTimeout(waitTime > 0 ? waitTime : 1000);
+          continue;
+        } else {
+          throw error;
+        }
+      }
+    } else {
+      await setTimeout(1000);
     }
-    await setTimeout(1000);
   }
-  const result = await concurrencyLimiter.schedule(() => job());
-  globalInputTokens += result.inputTokens;
-  globalOutputTokens += result.outputTokens;
-  return { result: result.markdown, inputTokens: result.inputTokens, outputTokens: result.outputTokens };
 }
 
 function getPdfFilesInDirectory(directoryPath: string): string[] {
