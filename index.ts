@@ -321,15 +321,15 @@ async function main(): Promise<void> {
           console.error(`Error: File not found: ${pdfPath}`)
           process.exit(1)
         }
- 
+
         console.log(`Processing PDF: ${pdfPath}`)
         // Estimate token usage for the file
         const { inputTokens } = await countTokens(pdfPath)
         const estimatedTokenCost = inputTokens + 1100
         console.log(`Estimated token cost for processing: ${estimatedTokenCost}`)
- 
+
         const markdown = await tokenLimiter.schedule({ weight: estimatedTokenCost }, () => concurrencyLimiter.schedule(() => analyzeFile(pdfPath)))
- 
+
         // Save markdown to file
         await saveToFile(CONFIG.PATHS.MARKDOWN_OUTPUT, markdown)
         console.log(`Markdown conversion complete. Output saved to ${CONFIG.PATHS.MARKDOWN_OUTPUT}`)
@@ -379,13 +379,13 @@ async function main(): Promise<void> {
           const outputPath = path.join(analysisDir, `${fileName}.md`)
           return !fs.existsSync(outputPath)
         })
-        const numSkipped = allPdfFiles.length - pdfFiles.length;
+        const numSkipped = allPdfFiles.length - pdfFiles.length
         console.log(`Found ${allPdfFiles.length} PDF files in ${folderPath}. Skipping ${numSkipped} already processed files.`)
         if (pdfFiles.length === 0) {
-          console.log(`All files have already been processed. Nothing to do.`);
-          process.exit(0);
+          console.log(`All files have already been processed. Nothing to do.`)
+          process.exit(0)
         }
-        
+
         const combinedTokenLimit = 0.8 * (CONFIG.RATE_LIMITS.INPUT_TOKENS_PER_MINUTE + CONFIG.RATE_LIMITS.OUTPUT_TOKENS_PER_MINUTE)
         tokenLimiter.updateSettings({
           reservoir: combinedTokenLimit,
