@@ -316,10 +316,15 @@ async function main(): Promise<void> {
           console.error(`Error: File not found: ${pdfPath}`)
           process.exit(1)
         }
-
+ 
         console.log(`Processing PDF: ${pdfPath}`)
-        const markdown = await analysisLimiter.schedule(() => analyzeFile(pdfPath))
-
+        // Estimate token usage for the file
+        const { inputTokens } = await countTokens(pdfPath)
+        const estimatedTokenCost = inputTokens * 1.5
+        console.log(`Estimated token cost for processing: ${estimatedTokenCost}`)
+ 
+        const markdown = await analysisLimiter.schedule({ weight: estimatedTokenCost }, () => analyzeFile(pdfPath))
+ 
         // Save markdown to file
         await saveToFile(CONFIG.PATHS.MARKDOWN_OUTPUT, markdown)
         console.log(`Markdown conversion complete. Output saved to ${CONFIG.PATHS.MARKDOWN_OUTPUT}`)
@@ -369,49 +374,19 @@ async function main(): Promise<void> {
         }
         console.log(`Found ${pdfFiles.length} PDF files in ${folderPath}`)
 
-        // Sample 20 random documents for token usage estimation
-        const sampleCount = Math.min(20, pdfFiles.length)
-        const shuffled = pdfFiles.sort(() => 0.5 - Math.random())
-        const sampleFiles = shuffled.slice(0, sampleCount)
-
-        console.log("Sampling 20 documents for token usage estimation...")
-        const sampleResults = await Promise.all(sampleFiles.map(async (filePath) => {
-          try {
-            const { inputTokens } = await countTokens(filePath)
-            return inputTokens
-          } catch (error) {
-            console.error(`Error counting tokens for ${filePath}:`, error)
-            return 0
-          }
-        }))
-
-        const validSamples = sampleResults.filter(t => t > 0)
-        if (validSamples.length === 0) {
-          console.error("Error: Unable to estimate token usage from samples.")
-          process.exit(1)
-        }
-        const avgInput = validSamples.reduce((sum, t) => sum + t, 0) / validSamples.length
-        const avgOutput = avgInput * 0.5 // assume output tokens are half of input tokens
-
-        const tasksPerMinuteInput = Math.floor((0.8 * CONFIG.RATE_LIMITS.INPUT_TOKENS_PER_MINUTE) / avgInput)
-        const tasksPerMinuteOutput = Math.floor((0.8 * CONFIG.RATE_LIMITS.OUTPUT_TOKENS_PER_MINUTE) / avgOutput)
-        let tasksPerMinuteAllowed = Math.min(tasksPerMinuteInput, tasksPerMinuteOutput)
-        tasksPerMinuteAllowed = Math.max(tasksPerMinuteAllowed, 1)
-
+        const combinedTokenLimit = 0.8 * (CONFIG.RATE_LIMITS.INPUT_TOKENS_PER_MINUTE + CONFIG.RATE_LIMITS.OUTPUT_TOKENS_PER_MINUTE)
         analysisLimiter.updateSettings({
-          reservoir: tasksPerMinuteAllowed,
-          reservoirRefreshAmount: tasksPerMinuteAllowed,
+          reservoir: combinedTokenLimit,
+          reservoirRefreshAmount: combinedTokenLimit,
           reservoirRefreshInterval: 60000,
-          maxConcurrent: Math.min(CONFIG.RATE_LIMITS.CONCURRENT_REQUESTS, tasksPerMinuteAllowed)
+          maxConcurrent: CONFIG.RATE_LIMITS.CONCURRENT_REQUESTS
         })
-
-        console.log(`Estimated average input tokens: ${avgInput.toFixed(2)}`)
-        console.log(`Configured analysis throughput: ${tasksPerMinuteAllowed} tasks per minute with max concurrent ${Math.min(CONFIG.RATE_LIMITS.CONCURRENT_REQUESTS, tasksPerMinuteAllowed)}`)
+        console.log(`Configured analysis throughput: a combined token limit of ${combinedTokenLimit} tokens per minute`)
 
         const analysisDir = ensureAnalysisDir(folderPath)
         console.log(`\nAnalysis will be saved to: ${analysisDir}\n`)
 
-        // Process all files concurrently using the analysisLimiter
+        // Process all files concurrently using the analysisLimiter with proper token-based weighting
         const analysisPromises = pdfFiles.map((filePath) => {
           const fileName = path.basename(filePath, '.pdf')
           const outputPath = path.join(analysisDir, `${fileName}.md`)
@@ -419,18 +394,23 @@ async function main(): Promise<void> {
             console.log(`Skipping: ${fileName}.md already exists.`)
             return Promise.resolve({ filePath, success: true, skipped: true })
           }
-          return analysisLimiter.schedule(async () => {
-            try {
-              console.log(`Processing: ${fileName}.pdf...`)
-              const markdown = await analyzeFile(filePath)
-              await saveToFile(outputPath, markdown)
-              console.log(`Finished processing: ${fileName}.pdf`)
-              return { filePath, success: true }
-            } catch (error) {
-              console.error(`Error processing ${filePath}:`, error)
-              return { filePath, success: false, error }
-            }
-          })
+          return (async () => {
+            const { inputTokens } = await countTokens(filePath)
+            const estimatedTokenCost = inputTokens * 1.5
+            console.log(`Estimated token cost for ${fileName}: ${estimatedTokenCost}`)
+            return analysisLimiter.schedule({ weight: estimatedTokenCost }, async () => {
+              try {
+                console.log(`Processing: ${fileName}.pdf...`)
+                const markdown = await analyzeFile(filePath)
+                await saveToFile(outputPath, markdown)
+                console.log(`Finished processing: ${fileName}.pdf`)
+                return { filePath, success: true }
+              } catch (error) {
+                console.error(`Error processing ${filePath}:`, error)
+                return { filePath, success: false, error }
+              }
+            })
+          })()
         })
 
         const analysisResults = await Promise.all(analysisPromises)
