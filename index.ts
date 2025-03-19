@@ -1,3 +1,4 @@
+import { Command } from 'commander';
 import { Anthropic } from '@anthropic-ai/sdk';
 
 // Configuration constants
@@ -9,6 +10,9 @@ const CONFIG = {
     MODEL: 'claude-3-7-sonnet-20250219',
     MAX_TOKENS: 16000,
     TIMEOUT_MS: 300000 // 5 minute timeout
+  },
+  PRICING: {
+    INPUT_PER_MILLION: 3 // $3 per million tokens
   }
 };
 
@@ -115,25 +119,126 @@ async function analyzeFile(pdfPath: string): Promise<string> {
 }
 
 /**
- * Main function
+ * Counts tokens in a PDF file using Anthropic API
+ * @param pdfPath - Path to the PDF file
+ * @returns Token count and cost information
  */
-async function main(): Promise<void> {
-  const pdfPath = Bun.argv[2];
+async function countTokens(pdfPath: string): Promise<{inputTokens: number, cost: number}> {
+  const apiKey = Bun.env.ANTHROPIC_API_KEY;
   
-  if (!pdfPath) {
-    console.error('Please provide a path to a PDF file');
-    process.exit(1);
+  if (!apiKey) {
+    throw new Error('ANTHROPIC_API_KEY environment variable is not set');
   }
   
-  try {
-    const markdown = await analyzeFile(pdfPath);
-    
-    // Save markdown to file
-    await saveToFile(CONFIG.PATHS.MARKDOWN_OUTPUT, markdown);
-    console.log(`Markdown conversion complete. Output saved to ${CONFIG.PATHS.MARKDOWN_OUTPUT}`);
-  } catch (error) {
-    console.error('Error:', error);
-    process.exit(1);
+  console.log(`Reading PDF file: ${pdfPath}...`);
+  const pdfFile = Bun.file(pdfPath);
+  const pdfBuffer = await pdfFile.arrayBuffer();
+  
+  // Convert PDF to base64
+  const pdfBase64 = Buffer.from(pdfBuffer).toString('base64');
+  console.log(`PDF read and converted to base64 (${pdfBase64.length} chars)`);
+  
+  // Validate base64
+  validateBase64(pdfBase64);
+  
+  const anthropic = new Anthropic({ 
+    apiKey,
+    timeout: CONFIG.CLAUDE.TIMEOUT_MS 
+  });
+  
+  console.log("Counting tokens...");
+  const response = await anthropic.messages.countTokens({
+    model: CONFIG.CLAUDE.MODEL,
+    messages: [{
+      role: 'user',
+      content: [
+        {
+          type: 'document',
+          source: {
+            type: 'base64',
+            media_type: 'application/pdf',
+            data: pdfBase64
+          }
+        },
+        {
+          type: 'text',
+          text: 'Please summarize this document.'
+        }
+      ]
+    }]
+  });
+  
+  const inputTokens = response.input_tokens;
+  const cost = (inputTokens / 1000000) * CONFIG.PRICING.INPUT_PER_MILLION;
+  
+  return { inputTokens, cost };
+}
+
+/**
+ * Main function using Commander to parse arguments
+ */
+async function main(): Promise<void> {
+  const program = new Command();
+  
+  program
+    .name('pdf-analyzer')
+    .description('PDF analysis tool using Claude API')
+    .version('1.0.0');
+  
+  program
+    .command('convert')
+    .description('Convert a PDF to markdown')
+    .argument('<pdfPath>', 'path to PDF file')
+    .action(async (pdfPath) => {
+      try {
+        // Check if file exists
+        const file = Bun.file(pdfPath);
+        const exists = await file.exists();
+        if (!exists) {
+          console.error(`Error: File not found: ${pdfPath}`);
+          process.exit(1);
+        }
+        
+        console.log(`Processing PDF: ${pdfPath}`);
+        const markdown = await analyzeFile(pdfPath);
+        
+        // Save markdown to file
+        await saveToFile(CONFIG.PATHS.MARKDOWN_OUTPUT, markdown);
+        console.log(`Markdown conversion complete. Output saved to ${CONFIG.PATHS.MARKDOWN_OUTPUT}`);
+      } catch (error) {
+        console.error('Error:', error);
+        process.exit(1);
+      }
+    });
+  
+  program
+    .command('countTokens')
+    .description('Count tokens in a PDF file and calculate cost')
+    .argument('<pdfPath>', 'path to PDF file')
+    .action(async (pdfPath) => {
+      try {
+        // Check if file exists
+        const file = Bun.file(pdfPath);
+        const exists = await file.exists();
+        if (!exists) {
+          console.error(`Error: File not found: ${pdfPath}`);
+          process.exit(1);
+        }
+        
+        const { inputTokens, cost } = await countTokens(pdfPath);
+        console.log(`\nToken count: ${inputTokens.toLocaleString()}`);
+        console.log(`Estimated cost: $${cost.toFixed(4)} (at $${CONFIG.PRICING.INPUT_PER_MILLION} per million tokens)`);
+      } catch (error) {
+        console.error('Error:', error);
+        process.exit(1);
+      }
+    });
+  
+  // For backward compatibility, make convert the default command
+  if (Bun.argv.length === 3 && !Bun.argv[2].startsWith('-')) {
+    program.parse(['node', 'script.js', 'convert', Bun.argv[2]]);
+  } else {
+    program.parse();
   }
 }
 
