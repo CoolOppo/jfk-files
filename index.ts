@@ -413,14 +413,14 @@ async function main(): Promise<void> {
 
         // Process all files concurrently using the analysisLimiter
         const analysisPromises = pdfFiles.map((filePath) => {
+          const fileName = path.basename(filePath, '.pdf')
+          const outputPath = path.join(analysisDir, `${fileName}.md`)
+          if (fs.existsSync(outputPath)) {
+            console.log(`Skipping: ${fileName}.md already exists.`)
+            return Promise.resolve({ filePath, success: true, skipped: true })
+          }
           return analysisLimiter.schedule(async () => {
             try {
-              const fileName = path.basename(filePath, '.pdf')
-              const outputPath = path.join(analysisDir, `${fileName}.md`)
-              if (fs.existsSync(outputPath)) {
-                console.log(`Skipping: ${fileName}.md already exists.`)
-                return { filePath, success: true, skipped: true }
-              }
               console.log(`Processing: ${fileName}.pdf...`)
               const markdown = await analyzeFile(filePath)
               await saveToFile(outputPath, markdown)
