@@ -36,6 +36,10 @@ let concurrencyLimiter = new Bottleneck({
   maxConcurrent: CONFIG.RATE_LIMITS.CONCURRENT_REQUESTS
 })
 
+let globalInputTokens = 0;
+let globalOutputTokens = 0;
+let windowStartTime = Date.now();
+
 
 
 
@@ -117,7 +121,7 @@ Please proceed with your analysis of the declassified document.`
  * @param pdfBase64 - Base64 encoded PDF data
  * @returns Markdown content from Claude
  */
-async function analyzeWithClaude(pdfBase64: string): Promise<string> {
+async function analyzeWithClaude(pdfBase64: string): Promise<{ markdown: string, inputTokens: number, outputTokens: number }> {
   const apiKey = Bun.env.ANTHROPIC_API_KEY
 
   if (!apiKey) {
@@ -167,7 +171,9 @@ Today, the US government declassified many documents in a large document dump ab
         markdownContent += item.text
       }
     }
-    return markdownContent
+    const inputTokens = response.usage?.input_tokens || 0
+    const outputTokens = response.usage?.output_tokens || 0
+    return { markdown: markdownContent, inputTokens, outputTokens }
   }
 
   throw new Error('Unexpected response format from Claude API')
@@ -178,7 +184,7 @@ Today, the US government declassified many documents in a large document dump ab
  * @param pdfPath - Path to the PDF file to process
  * @returns Markdown content
  */
-async function analyzeFile(pdfPath: string): Promise<string> {
+async function analyzeFile(pdfPath: string): Promise<{ markdown: string, inputTokens: number, outputTokens: number }> {
   // Read PDF file
   console.log(`Reading PDF file: ${pdfPath}...`)
   const pdfFile = Bun.file(pdfPath)
@@ -200,6 +206,26 @@ async function analyzeFile(pdfPath: string): Promise<string> {
  * @param directoryPath - Path to the directory
  * @returns Array of PDF file paths
  */
+async function scheduleAnalysis(job: () => Promise<{ markdown: string, inputTokens: number, outputTokens: number }>): Promise<{ result: string, inputTokens: number, outputTokens: number }> {
+  while (true) {
+    const now = Date.now();
+    if (now - windowStartTime >= 60000) {
+      windowStartTime = now;
+      globalInputTokens = 0;
+      globalOutputTokens = 0;
+      break;
+    }
+    if (globalInputTokens < CONFIG.RATE_LIMITS.INPUT_TOKENS_PER_MINUTE && globalOutputTokens < CONFIG.RATE_LIMITS.OUTPUT_TOKENS_PER_MINUTE) {
+      break;
+    }
+    await setTimeout(1000);
+  }
+  const result = await concurrencyLimiter.schedule(() => job());
+  globalInputTokens += result.inputTokens;
+  globalOutputTokens += result.outputTokens;
+  return { result: result.markdown, inputTokens: result.inputTokens, outputTokens: result.outputTokens };
+}
+
 function getPdfFilesInDirectory(directoryPath: string): string[] {
   const files = fs.readdirSync(directoryPath)
   return files
@@ -321,15 +347,10 @@ async function main(): Promise<void> {
           console.error(`Error: File not found: ${pdfPath}`)
           process.exit(1)
         }
-
+ 
         console.log(`Processing PDF: ${pdfPath}`)
-        // Estimate token usage for the file
-        const { inputTokens } = await countTokens(pdfPath)
-        const estimatedTokenCost = inputTokens + 1100
-        console.log(`Estimated token cost for processing: ${estimatedTokenCost}`)
-
-        const markdown = await concurrencyLimiter.schedule(() => tokenLimiter.schedule({ weight: estimatedTokenCost }, () => analyzeFile(pdfPath)));
-
+        const { result: markdown } = await scheduleAnalysis(() => analyzeFile(pdfPath));
+ 
         // Save markdown to file
         await saveToFile(CONFIG.PATHS.MARKDOWN_OUTPUT, markdown)
         console.log(`Markdown conversion complete. Output saved to ${CONFIG.PATHS.MARKDOWN_OUTPUT}`)
