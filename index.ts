@@ -3,6 +3,7 @@ import { Anthropic } from '@anthropic-ai/sdk'
 import * as fs from 'fs'
 import * as path from 'path'
 import * as readline from 'readline'
+import { setTimeout } from 'timers/promises'
 
 // Configuration constants
 const CONFIG = {
@@ -15,9 +16,111 @@ const CONFIG = {
     TIMEOUT_MS: 300000 // 5 minute timeout
   },
   PRICING: {
-    INPUT_PER_MILLION: 0.8 // $3 per million tokens
+    INPUT_PER_MILLION: 0.8 // $0.80 per million tokens
+  },
+  RATE_LIMITS: {
+    REQUESTS_PER_MINUTE: 4000,
+    INPUT_TOKENS_PER_MINUTE: 400000,
+    OUTPUT_TOKENS_PER_MINUTE: 80000,
+    CONCURRENT_REQUESTS: 10 // Conservative default concurrent requests
   }
 }
+
+/**
+ * Rate limiter to manage API request rate
+ */
+class RateLimiter {
+  private requestCount: number = 0
+  private inputTokenCount: number = 0
+  private outputTokenCount: number = 0
+  private lastResetTime: number = Date.now()
+  private queue: Array<() => Promise<any>> = []
+  private runningTasks: number = 0
+  private maxConcurrent: number
+
+  constructor(maxConcurrent: number = CONFIG.RATE_LIMITS.CONCURRENT_REQUESTS) {
+    this.maxConcurrent = maxConcurrent
+    // Reset counters every minute
+    setInterval(() => this.resetCounters(), 60000)
+  }
+
+  private resetCounters(): void {
+    this.requestCount = 0
+    this.inputTokenCount = 0
+    this.outputTokenCount = 0
+    this.lastResetTime = Date.now()
+    console.log('Rate limit counters reset')
+  }
+
+  private async processQueue(): Promise<void> {
+    if (this.queue.length === 0 || this.runningTasks >= this.maxConcurrent) {
+      return
+    }
+
+    const task = this.queue.shift()
+    if (!task) return
+
+    this.runningTasks++
+    try {
+      await task()
+    } catch (error) {
+      console.error('Error in queued task:', error)
+    } finally {
+      this.runningTasks--
+      // Process next task
+      this.processQueue()
+    }
+  }
+
+  public async enqueue<T>(task: () => Promise<T>): Promise<T> {
+    return new Promise((resolve, reject) => {
+      this.queue.push(async () => {
+        try {
+          const result = await task()
+          resolve(result)
+        } catch (error) {
+          reject(error)
+        }
+      })
+
+      // Start processing the queue
+      this.processQueue()
+    })
+  }
+
+  public async trackRequest(inputTokens: number = 0, outputTokens: number = 0): Promise<void> {
+    // Check if we're approaching rate limits
+    if (
+      this.requestCount >= CONFIG.RATE_LIMITS.REQUESTS_PER_MINUTE ||
+      this.inputTokenCount + inputTokens >= CONFIG.RATE_LIMITS.INPUT_TOKENS_PER_MINUTE ||
+      this.outputTokenCount + outputTokens >= CONFIG.RATE_LIMITS.OUTPUT_TOKENS_PER_MINUTE
+    ) {
+      // Wait until the next minute reset
+      const timeUntilReset = 60000 - (Date.now() - this.lastResetTime)
+      if (timeUntilReset > 0) {
+        console.log(`Rate limit approaching, waiting ${Math.ceil(timeUntilReset / 1000)} seconds...`)
+        await setTimeout(timeUntilReset)
+      }
+    }
+
+    // Track this request
+    this.requestCount++
+    this.inputTokenCount += inputTokens
+    this.outputTokenCount += outputTokens
+  }
+
+  // Return current usage as percentages of limits
+  public getUsagePercentages(): { requests: number, inputTokens: number, outputTokens: number } {
+    return {
+      requests: (this.requestCount / CONFIG.RATE_LIMITS.REQUESTS_PER_MINUTE) * 100,
+      inputTokens: (this.inputTokenCount / CONFIG.RATE_LIMITS.INPUT_TOKENS_PER_MINUTE) * 100,
+      outputTokens: (this.outputTokenCount / CONFIG.RATE_LIMITS.OUTPUT_TOKENS_PER_MINUTE) * 100
+    }
+  }
+}
+
+// Create a single instance of the rate limiter
+const rateLimiter = new RateLimiter()
 
 
 /**
@@ -99,60 +202,70 @@ Please proceed with your analysis of the declassified document.`
  * @returns Markdown content from Claude
  */
 async function analyzeWithClaude(pdfBase64: string): Promise<string> {
-  const apiKey = Bun.env.ANTHROPIC_API_KEY
+  return rateLimiter.enqueue(async () => {
+    const apiKey = Bun.env.ANTHROPIC_API_KEY
 
-  if (!apiKey) {
-    throw new Error('ANTHROPIC_API_KEY environment variable is not set')
-  }
+    if (!apiKey) {
+      throw new Error('ANTHROPIC_API_KEY environment variable is not set')
+    }
 
-  console.log("Sending to Claude API...")
-  const anthropic = new Anthropic({
-    apiKey,
-    timeout: CONFIG.CLAUDE.TIMEOUT_MS
-  })
+    console.log("Sending to Claude API...")
+    const anthropic = new Anthropic({
+      apiKey,
+      timeout: CONFIG.CLAUDE.TIMEOUT_MS
+    })
 
-  const response = await anthropic.messages.create({
-    model: CONFIG.CLAUDE.MODEL,
-    max_tokens: CONFIG.CLAUDE.MAX_TOKENS,
-    temperature: 0,
-    system: `Your knowledge cutoff is October of 2024.
+    // Track request before sending (we don't know token counts yet)
+    await rateLimiter.trackRequest()
+    
+    const response = await anthropic.messages.create({
+      model: CONFIG.CLAUDE.MODEL,
+      max_tokens: CONFIG.CLAUDE.MAX_TOKENS,
+      temperature: 0,
+      system: `Your knowledge cutoff is October of 2024.
 Today is March 18th, 2025.
 Today, the US government declassified many documents in a large document dump about the JFK assassination in an effort to improve transparency.`,
-    messages: [
-      {
-        role: 'user',
-        content: [
-          {
-            type: 'document',
-            source: {
-              type: 'base64',
-              media_type: 'application/pdf',
-              data: pdfBase64,
+      messages: [
+        {
+          role: 'user',
+          content: [
+            {
+              type: 'document',
+              source: {
+                type: 'base64',
+                media_type: 'application/pdf',
+                data: pdfBase64,
+              },
             },
-          },
-          {
-            type: 'text',
-            text: analysisPrompt,
-          },
-        ],
-      },
-    ],
-  })
+            {
+              type: 'text',
+              text: analysisPrompt,
+            },
+          ],
+        },
+      ],
+    })
 
-  console.log('Response received from Claude API')
+    console.log('Response received from Claude API')
+    
+    // Track token usage
+    const inputTokens = response.usage?.input_tokens || 0
+    const outputTokens = response.usage?.output_tokens || 0
+    await rateLimiter.trackRequest(inputTokens, outputTokens)
 
-  // Extract text content
-  let markdownContent = ''
-  if (Array.isArray(response.content)) {
-    for (const item of response.content) {
-      if (item.type === 'text') {
-        markdownContent += item.text
+    // Extract text content
+    let markdownContent = ''
+    if (Array.isArray(response.content)) {
+      for (const item of response.content) {
+        if (item.type === 'text') {
+          markdownContent += item.text
+        }
       }
+      return markdownContent
     }
-    return markdownContent
-  }
 
-  throw new Error('Unexpected response format from Claude API')
+    throw new Error('Unexpected response format from Claude API')
+  })
 }
 
 /**
@@ -227,54 +340,63 @@ async function askForConfirmation(question: string): Promise<boolean> {
  * @returns Token count and cost information
  */
 async function countTokens(pdfPath: string): Promise<{ inputTokens: number, cost: number }> {
-  const apiKey = Bun.env.ANTHROPIC_API_KEY
+  return rateLimiter.enqueue(async () => {
+    const apiKey = Bun.env.ANTHROPIC_API_KEY
 
-  if (!apiKey) {
-    throw new Error('ANTHROPIC_API_KEY environment variable is not set')
-  }
+    if (!apiKey) {
+      throw new Error('ANTHROPIC_API_KEY environment variable is not set')
+    }
 
-  console.log(`Reading PDF file: ${pdfPath}...`)
-  const pdfFile = Bun.file(pdfPath)
-  const pdfBuffer = await pdfFile.arrayBuffer()
+    console.log(`Reading PDF file: ${pdfPath}...`)
+    const pdfFile = Bun.file(pdfPath)
+    const pdfBuffer = await pdfFile.arrayBuffer()
 
-  // Convert PDF to base64
-  const pdfBase64 = Buffer.from(pdfBuffer).toString('base64')
-  console.log(`PDF read and converted to base64 (${pdfBase64.length} chars)`)
+    // Convert PDF to base64
+    const pdfBase64 = Buffer.from(pdfBuffer).toString('base64')
+    console.log(`PDF read and converted to base64 (${pdfBase64.length} chars)`)
 
-  // Validate base64
-  validateBase64(pdfBase64)
+    // Validate base64
+    validateBase64(pdfBase64)
 
-  const anthropic = new Anthropic({
-    apiKey,
-    timeout: CONFIG.CLAUDE.TIMEOUT_MS
-  })
+    const anthropic = new Anthropic({
+      apiKey,
+      timeout: CONFIG.CLAUDE.TIMEOUT_MS
+    })
 
-  console.log("Counting tokens...")
-  const response = await anthropic.messages.countTokens({
-    model: CONFIG.CLAUDE.MODEL,
-    messages: [{
-      role: 'user',
-      content: [
-        {
-          type: 'document',
-          source: {
-            type: 'base64',
-            media_type: 'application/pdf',
-            data: pdfBase64
+    console.log("Counting tokens...")
+    
+    // Track this API request (no output tokens for count endpoint)
+    await rateLimiter.trackRequest()
+    
+    const response = await anthropic.messages.countTokens({
+      model: CONFIG.CLAUDE.MODEL,
+      messages: [{
+        role: 'user',
+        content: [
+          {
+            type: 'document',
+            source: {
+              type: 'base64',
+              media_type: 'application/pdf',
+              data: pdfBase64
+            }
+          },
+          {
+            type: 'text',
+            text: analysisPrompt
           }
-        },
-        {
-          type: 'text',
-          text: analysisPrompt
-        }
-      ]
-    }]
+        ]
+      }]
+    })
+
+    const inputTokens = response.input_tokens
+    const cost = (inputTokens / 1000000) * CONFIG.PRICING.INPUT_PER_MILLION
+    
+    // Track token usage
+    await rateLimiter.trackRequest(inputTokens, 0)
+
+    return { inputTokens, cost }
   })
-
-  const inputTokens = response.input_tokens
-  const cost = (inputTokens / 1000000) * CONFIG.PRICING.INPUT_PER_MILLION
-
-  return { inputTokens, cost }
 }
 
 /**
@@ -287,6 +409,7 @@ async function main(): Promise<void> {
     .name('pdf-analyzer')
     .description('PDF analysis tool using Claude API')
     .version('1.0.0')
+    .option('-b, --batch-size <number>', 'Number of concurrent files to process', (val) => parseInt(val, 10))
 
   program
     .command('convert')
@@ -405,26 +528,52 @@ async function main(): Promise<void> {
         const analysisDir = ensureAnalysisDir(folderPath)
         console.log(`\nAnalysis will be saved to: ${analysisDir}`)
 
-        // Process all files in parallel
-        console.log("Processing all files...\n")
+        // Process files with rate limiting
+        console.log("Processing all files with rate limiting...\n")
+        
+        // Add a batch size option
+        program.option('-b, --batch-size <number>', 'Number of concurrent files to process', (val) => parseInt(val, 10))
+        const options = program.opts()
+        const batchSize = options.batchSize || CONFIG.RATE_LIMITS.CONCURRENT_REQUESTS
+        
+        console.log(`Using batch size of ${batchSize} concurrent requests`)
+        
+        // Process files with controlled concurrency
+        const analysisResults = []
+        for (let i = 0; i < validResults.length; i += batchSize) {
+          const batch = validResults.slice(i, i + batchSize)
+          console.log(`Processing batch ${Math.floor(i/batchSize) + 1} of ${Math.ceil(validResults.length/batchSize)}...`)
+          
+          const batchPromises = batch.map(async ({ filePath }) => {
+            try {
+              const fileName = path.basename(filePath, '.pdf')
+              const outputPath = path.join(analysisDir, `${fileName}.md`)
 
-        const analyzePromises = validResults.map(async ({ filePath }) => {
-          try {
-            const fileName = path.basename(filePath, '.pdf')
-            const outputPath = path.join(analysisDir, `${fileName}.md`)
+              console.log(`Processing: ${fileName}.pdf...`)
+              const markdown = await analyzeFile(filePath)
+              await saveToFile(outputPath, markdown)
 
-            console.log(`Processing: ${fileName}.pdf...`)
-            const markdown = await analyzeFile(filePath)
-            await saveToFile(outputPath, markdown)
-
-            return { filePath, success: true }
-          } catch (error) {
-            console.error(`Error processing ${filePath}:`, error)
-            return { filePath, success: false, error }
-          }
-        })
-
-        const analysisResults = await Promise.all(analyzePromises)
+              const result = { filePath, success: true }
+              analysisResults.push(result)
+              return result
+            } catch (error) {
+              console.error(`Error processing ${filePath}:`, error)
+              const result = { filePath, success: false, error }
+              analysisResults.push(result)
+              return result
+            }
+          })
+          
+          // Wait for current batch to complete before starting next batch
+          await Promise.all(batchPromises)
+          
+          // Display rate limit usage after each batch
+          const usage = rateLimiter.getUsagePercentages()
+          console.log(`\nCurrent rate limit usage:`)
+          console.log(`- Requests: ${usage.requests.toFixed(1)}%`)
+          console.log(`- Input tokens: ${usage.inputTokens.toFixed(1)}%`)
+          console.log(`- Output tokens: ${usage.outputTokens.toFixed(1)}%\n`)
+        }
 
         const successCount = analysisResults.filter(result => result.success).length
 
