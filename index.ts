@@ -4,7 +4,6 @@ import * as fs from 'fs'
 import * as path from 'path'
 import * as readline from 'readline'
 import { setTimeout } from 'timers/promises'
-import Bottleneck from 'bottleneck'
 
 // Configuration constants
 const CONFIG = {
@@ -27,21 +26,322 @@ const CONFIG = {
   }
 }
 
-let tokenLimiter = new Bottleneck({
-  maxConcurrent: 1000000,  // allow high job weights without blocking
-  reservoir: Infinity
-})
+/**
+ * Token rate limiter that properly handles both input and output token limits
+ */
+class TokenRateLimiter {
+  private inputTokensUsed = 0;
+  private outputTokensUsed = 0;
+  private requestsUsed = 0;
+  private windowStartTime = Date.now();
+  private activeRequests = 0;
+  private sampledRatio = 0.5; // Default estimate of output:input token ratio
+  private tokenSamples: { inputTokens: number, outputTokens: number }[] = [];
+  private pendingQueue: Array<{
+    resolve: (value: any) => void
+    reject: (error: any) => void
+    job: () => Promise<any>
+    inputTokenEstimate: number
+    retryAttempt: number
+  }> = [];
+  private retryDelays = [1000, 5000, 15000, 30000]; // Progressive backoff
+  private capacityCallbacks: Array<() => void> = [];
 
-let concurrencyLimiter = new Bottleneck({
-  maxConcurrent: CONFIG.RATE_LIMITS.CONCURRENT_REQUESTS
-})
+  constructor(
+    private readonly inputTokenLimit: number,
+    private readonly outputTokenLimit: number,
+    private readonly requestLimit: number,
+    private readonly concurrentLimit: number
+  ) {
+    // Set up regular window reset checks
+    setInterval(() => this.checkAndResetWindow(), 1000)
+  }
 
-let globalInputTokens = 0;
-let globalOutputTokens = 0;
-let windowStartTime = Date.now();
+  /**
+   * Update the output:input token ratio based on collected samples
+   */
+  updateTokenRatio(): void {
+    if (this.tokenSamples.length > 0) {
+      const totalInput = this.tokenSamples.reduce((sum, sample) => sum + sample.inputTokens, 0)
+      const totalOutput = this.tokenSamples.reduce((sum, sample) => sum + sample.outputTokens, 0)
+      if (totalInput > 0) {
+        this.sampledRatio = totalOutput / totalInput
+        console.log(`Updated output:input token ratio to ${this.sampledRatio.toFixed(2)}`)
+      }
+    }
+  }
 
+  /**
+   * Add a token usage sample to improve ratio estimation
+   */
+  addSample(inputTokens: number, outputTokens: number): void {
+    this.tokenSamples.push({ inputTokens, outputTokens })
+    // Keep last 20 samples for a moving average
+    if (this.tokenSamples.length > 20) {
+      this.tokenSamples.shift()
+    }
+    this.updateTokenRatio()
+  }
 
+  /**
+   * Estimate output tokens based on input tokens and current ratio
+   */
+  estimateOutputTokens(inputTokens: number): number {
+    return Math.ceil(inputTokens * this.sampledRatio)
+  }
 
+  /**
+   * Check if we need to reset the window
+   */
+  private checkAndResetWindow(): void {
+    const now = Date.now()
+    if (now - this.windowStartTime >= 60000) {
+      console.log(`Resetting rate limit window. Previous usage: ${this.inputTokensUsed} input, ${this.outputTokensUsed} output, ${this.requestsUsed} requests`)
+      this.inputTokensUsed = 0
+      this.outputTokensUsed = 0
+      this.requestsUsed = 0
+      this.windowStartTime = now
+
+      // Process pending queue if we have capacity now
+      this.processPendingQueue()
+    }
+  }
+
+  /**
+   * Process any pending requests in the queue
+   */
+  private processPendingQueue(): void {
+    // Process as many pending jobs as we have capacity for
+    while (this.pendingQueue.length > 0 && this.hasCapacity()) {
+      const nextJob = this.pendingQueue.shift()
+      if (nextJob) {
+        const { resolve, reject, job, inputTokenEstimate, retryAttempt } = nextJob
+
+        // Execute the job with the original parameters
+        this.executeJob(job, inputTokenEstimate, retryAttempt)
+          .then(resolve)
+          .catch(reject)
+      }
+    }
+
+    // Notify any capacity waiters
+    while (this.capacityCallbacks.length > 0 && this.hasCapacity()) {
+      const callback = this.capacityCallbacks.shift()
+      if (callback) callback()
+    }
+  }
+
+  /**
+   * Wait for capacity to become available
+   */
+  private waitForCapacity(): Promise<void> {
+    return new Promise(resolve => {
+      this.capacityCallbacks.push(resolve)
+    })
+  }
+
+  /**
+   * Check if we have capacity for a request with given token estimates
+   */
+  private hasCapacity(inputTokens: number = 0, estimatedOutputTokens: number = 0): boolean {
+    // Check if we've hit concurrent request limit
+    if (this.activeRequests >= this.concurrentLimit) {
+      return false
+    }
+
+    // Check if we'd exceed any token limits
+    if (this.inputTokensUsed + inputTokens > this.inputTokenLimit) {
+      return false
+    }
+
+    if (this.outputTokensUsed + estimatedOutputTokens > this.outputTokenLimit) {
+      return false
+    }
+
+    // Check request limit
+    if (this.requestsUsed + 1 > this.requestLimit) {
+      return false
+    }
+
+    return true
+  }
+
+  /**
+   * Execute a job with token accounting
+   */
+  private async executeJob<T>(
+    job: () => Promise<{ inputTokens: number, outputTokens: number, result: T }>,
+    inputTokenEstimate: number,
+    retryAttempt: number
+  ): Promise<{ inputTokens: number, outputTokens: number, result: T }> {
+    // Estimate output tokens based on input estimate and ratio
+    const outputTokenEstimate = inputTokenEstimate > 0
+      ? this.estimateOutputTokens(inputTokenEstimate)
+      : 0
+
+    // Reserve tokens and mark request active
+    this.activeRequests++
+    this.requestsUsed++
+
+    if (inputTokenEstimate > 0) {
+      this.inputTokensUsed += inputTokenEstimate
+      this.outputTokensUsed += outputTokenEstimate
+    }
+
+    try {
+      // Execute the job
+      const result = await job()
+
+      // Correct our usage with actual numbers
+      if (inputTokenEstimate > 0) {
+        // Adjust the counters if estimates were used
+        this.inputTokensUsed = this.inputTokensUsed - inputTokenEstimate + result.inputTokens
+        this.outputTokensUsed = this.outputTokensUsed - outputTokenEstimate + result.outputTokens
+      } else {
+        // Just add the actual usage
+        this.inputTokensUsed += result.inputTokens
+        this.outputTokensUsed += result.outputTokens
+      }
+
+      // Add sample to improve future estimates
+      this.addSample(result.inputTokens, result.outputTokens)
+
+      return result
+    } catch (error) {
+      // If estimate was used, remove it since the job failed
+      if (inputTokenEstimate > 0) {
+        this.inputTokensUsed -= inputTokenEstimate
+        this.outputTokensUsed -= outputTokenEstimate
+      }
+
+      throw error
+    } finally {
+      this.activeRequests--
+
+      // Process pending queue since we now have capacity
+      this.processPendingQueue()
+    }
+  }
+
+  /**
+   * Schedule a job with appropriate rate limiting
+   */
+  async schedule<T>(
+    job: () => Promise<{ inputTokens: number, outputTokens: number, result: T }>,
+    inputTokenEstimate: number = 0,
+    retryAttempt: number = 0
+  ): Promise<{ inputTokens: number, outputTokens: number, result: T }> {
+    // Check if window should be reset
+    this.checkAndResetWindow()
+
+    // Estimate output tokens based on input estimate and current ratio
+    const outputTokenEstimate = inputTokenEstimate > 0
+      ? this.estimateOutputTokens(inputTokenEstimate)
+      : 0
+
+    // If we don't have capacity, queue the job
+    if (!this.hasCapacity(inputTokenEstimate, outputTokenEstimate)) {
+      return new Promise((resolve, reject) => {
+        // Add to pending queue
+        this.pendingQueue.push({
+          resolve,
+          reject,
+          job,
+          inputTokenEstimate,
+          retryAttempt
+        })
+
+        // Log queue size periodically
+        if (this.pendingQueue.length % 10 === 0) {
+          console.log(`Rate limit queue size: ${this.pendingQueue.length}`)
+        }
+      })
+    }
+
+    // We have capacity, execute the job
+    try {
+      return await this.executeJob(job, inputTokenEstimate, retryAttempt)
+    } catch (error) {
+      // Handle API errors related to rate limiting
+      return this.handleRetry(job, inputTokenEstimate, error, retryAttempt)
+    }
+  }
+
+  /**
+   * Handle retries with progressive backoff
+   */
+  private async handleRetry<T>(
+    job: () => Promise<{ inputTokens: number, outputTokens: number, result: T }>,
+    inputTokenEstimate: number,
+    error: any,
+    retryAttempt: number
+  ): Promise<{ inputTokens: number, outputTokens: number, result: T }> {
+    // Check if error is related to rate limiting
+    const isRateLimitError = error?.message && (
+      error.message.includes("rate limit") ||
+      error.message.includes("429") ||
+      error.message.includes("too many requests")
+    )
+
+    if (isRateLimitError && retryAttempt < this.retryDelays.length) {
+      // Get backoff delay
+      const delay = this.retryDelays[retryAttempt]
+      console.log(`Rate limit hit. Retrying in ${delay}ms (attempt ${retryAttempt + 1}/${this.retryDelays.length})`)
+
+      // Wait for backoff period
+      await setTimeout(delay)
+
+      // Wait for capacity if needed
+      if (!this.hasCapacity(inputTokenEstimate, this.estimateOutputTokens(inputTokenEstimate))) {
+        await this.waitForCapacity()
+      }
+
+      // Retry the job
+      return this.schedule(job, inputTokenEstimate, retryAttempt + 1)
+    }
+
+    // If not a rate limit error or we've exhausted retries, throw the error
+    throw error
+  }
+
+  /**
+   * Get current usage statistics
+   */
+  getStats() {
+    return {
+      inputTokensUsed: this.inputTokensUsed,
+      outputTokensUsed: this.outputTokensUsed,
+      requestsUsed: this.requestsUsed,
+      activeRequests: this.activeRequests,
+      queueSize: this.pendingQueue.length,
+      outputInputRatio: this.sampledRatio,
+      windowTimeRemaining: 60000 - (Date.now() - this.windowStartTime)
+    }
+  }
+
+  /**
+   * Print current stats for debugging
+   */
+  logStats() {
+    const stats = this.getStats()
+    console.log(`Rate Limiter Stats:
+Input tokens: ${stats.inputTokensUsed}/${this.inputTokenLimit} (${(stats.inputTokensUsed / this.inputTokenLimit * 100).toFixed(1)}%)
+Output tokens: ${stats.outputTokensUsed}/${this.outputTokenLimit} (${(stats.outputTokensUsed / this.outputTokenLimit * 100).toFixed(1)}%)
+Requests: ${stats.requestsUsed}/${this.requestLimit}
+Active requests: ${stats.activeRequests}/${this.concurrentLimit}
+Queue size: ${stats.queueSize}
+Output:Input ratio: ${stats.outputInputRatio.toFixed(2)}
+Window resets in: ${Math.floor(stats.windowTimeRemaining / 1000)}s`)
+  }
+}
+
+// Initialize the rate limiter
+const rateLimiter = new TokenRateLimiter(
+  CONFIG.RATE_LIMITS.INPUT_TOKENS_PER_MINUTE,
+  CONFIG.RATE_LIMITS.OUTPUT_TOKENS_PER_MINUTE,
+  CONFIG.RATE_LIMITS.REQUESTS_PER_MINUTE,
+  CONFIG.RATE_LIMITS.CONCURRENT_REQUESTS
+)
 
 /**
  * Saves buffer data to a file
@@ -202,39 +502,104 @@ async function analyzeFile(pdfPath: string): Promise<{ markdown: string, inputTo
 }
 
 /**
- * Get all PDF files in a directory
- * @param directoryPath - Path to the directory
- * @returns Array of PDF file paths
+ * Schedule a PDF analysis job with the rate limiter
  */
-async function scheduleAnalysis(job: () => Promise<{ markdown: string, inputTokens: number, outputTokens: number }>): Promise<{ result: string, inputTokens: number, outputTokens: number }> {
-  while (true) {
-    const now = Date.now();
-    if (now - windowStartTime >= 60000) {
-      windowStartTime = now;
-      globalInputTokens = 0;
-      globalOutputTokens = 0;
-    }
-    if (globalInputTokens < CONFIG.RATE_LIMITS.INPUT_TOKENS_PER_MINUTE && globalOutputTokens <= CONFIG.RATE_LIMITS.OUTPUT_TOKENS_PER_MINUTE - 400) {
-      try {
-        const result = await concurrencyLimiter.schedule(() => job());
-        globalInputTokens += result.inputTokens;
-        globalOutputTokens += result.outputTokens;
-        return { result: result.markdown, inputTokens: result.inputTokens, outputTokens: result.outputTokens };
-      } catch (error) {
-        if (error?.message && error.message.includes("output") && error.message.includes("rate limit")) {
-          const nowRetry = Date.now();
-          const waitTime = 60000 - (nowRetry - windowStartTime);
-          console.error(`Output token rate limit hit. Waiting ${waitTime}ms before retrying.`);
-          await setTimeout(waitTime > 0 ? waitTime : 1000);
-          continue;
-        } else {
-          throw error;
+async function scheduleAnalysis(job: () => Promise<{ markdown: string, inputTokens: number, outputTokens: number }>, inputTokenEstimate: number = 0): Promise<{ result: string, inputTokens: number, outputTokens: number }> {
+  try {
+    const result = await rateLimiter.schedule(
+      async () => {
+        const response = await job()
+        return {
+          inputTokens: response.inputTokens,
+          outputTokens: response.outputTokens,
+          result: response.markdown
         }
+      },
+      inputTokenEstimate
+    )
+
+    return result
+  } catch (error) {
+    console.error('Error during analysis:', error)
+    throw error
+  }
+}
+
+/**
+ * Sample a subset of PDFs to estimate token usage
+ */
+async function sampleTokenUsage(pdfFiles: string[], sampleSize: number = Math.min(10, pdfFiles.length)): Promise<{
+  avgInputTokens: number,
+  avgOutputTokens: number,
+  ratio: number
+}> {
+  // Take either sampleSize or all files, whichever is smaller
+  const samplesToTake = Math.min(sampleSize, pdfFiles.length)
+  if (samplesToTake === 0) return { avgInputTokens: 0, avgOutputTokens: 0, ratio: 0.5 }
+
+  console.log(`Sampling ${samplesToTake} files to estimate token usage...`)
+
+  // Use a stratified sampling approach - get files of different sizes
+  // Sort files by size to get a distribution
+  const filesWithSize = await Promise.all(
+    pdfFiles.map(async file => {
+      const stats = await fs.promises.stat(file)
+      return { file, size: stats.size }
+    })
+  )
+
+  // Sort by size
+  filesWithSize.sort((a, b) => a.size - b.size)
+
+  // Select files from different size percentiles
+  const sampleFiles: string[] = []
+  if (samplesToTake === 1) {
+    // If only one sample, take the median
+    const medianIndex = Math.floor(filesWithSize.length / 2)
+    if (filesWithSize[medianIndex]) {
+      sampleFiles.push(filesWithSize[medianIndex].file)
+    }
+  } else {
+    // Otherwise distribute samples across the range
+    for (let i = 0; i < samplesToTake; i++) {
+      const index = Math.floor(i * (filesWithSize.length - 1) / (samplesToTake - 1))
+      if (filesWithSize[index]) {
+        sampleFiles.push(filesWithSize[index].file)
       }
-    } else {
-      await setTimeout(1000);
     }
   }
+
+  console.log(`Selected sample files: ${sampleFiles.map(f => path.basename(f)).join(', ')}`)
+
+  // Count tokens for each sample file
+  const tokenCounts = await Promise.all(
+    sampleFiles.map(async file => {
+      console.log(`Sampling token count for: ${path.basename(file)}`)
+      const { inputTokens, cost } = await countTokens(file)
+
+      // Initial estimate is only for the first batch calculation
+      // We'll get real output tokens when we process files
+      const estimatedOutputTokens = Math.round(inputTokens * 0.5) // Initial guess at ratio
+
+      return { file, inputTokens, estimatedOutputTokens }
+    })
+  )
+
+  // Calculate average token counts
+  const totalInputTokens = tokenCounts.reduce((sum, count) => sum + count.inputTokens, 0)
+  const totalEstimatedOutputTokens = tokenCounts.reduce((sum, count) => sum + count.estimatedOutputTokens, 0)
+
+  const avgInputTokens = Math.round(totalInputTokens / tokenCounts.length)
+  const avgOutputTokens = Math.round(totalEstimatedOutputTokens / tokenCounts.length)
+
+  const ratio = avgOutputTokens / avgInputTokens
+
+  console.log(`Token usage estimates:
+Average input tokens per file: ${avgInputTokens}
+Estimated average output tokens per file: ${avgOutputTokens}
+Output:Input ratio: ${ratio.toFixed(2)}`)
+
+  return { avgInputTokens, avgOutputTokens, ratio }
 }
 
 function getPdfFilesInDirectory(directoryPath: string): string[] {
@@ -333,6 +698,58 @@ async function countTokens(pdfPath: string): Promise<{ inputTokens: number, cost
   return { inputTokens, cost }
 }
 
+// Process batch of files in parallel, respecting rate limits
+async function processBatch(
+  pdfFiles: string[],
+  analysisDir: string,
+  batchSize: number,
+  inputTokenEstimate: number,
+  onProgress: (completed: number, total: number) => void
+): Promise<Array<{ filePath: string, success: boolean, inputTokens?: number, outputTokens?: number, error?: any }>> {
+  const results: Array<{ filePath: string, success: boolean, inputTokens?: number, outputTokens?: number, error?: any }> = []
+  let completed = 0
+  const total = pdfFiles.length
+
+  // Process in batches to control memory usage
+  for (let i = 0; i < pdfFiles.length; i += batchSize) {
+    const batch = pdfFiles.slice(i, i + batchSize).filter(Boolean)
+
+    // Process this batch in parallel
+    const batchPromises = batch.map(async (filePath) => {
+      const fileName = path.basename(filePath, '.pdf')
+      const outputPath = path.join(analysisDir, `${fileName}.md`)
+
+      try {
+        console.log(`Processing: ${fileName}.pdf...`)
+        const { result: markdown, inputTokens, outputTokens } = await scheduleAnalysis(
+          () => analyzeFile(filePath),
+          inputTokenEstimate
+        )
+
+        await saveToFile(outputPath, markdown)
+        console.log(`Finished processing: ${fileName}.pdf (${inputTokens} input, ${outputTokens} output tokens, ratio: ${(outputTokens / inputTokens).toFixed(2)})`)
+
+        completed++
+        onProgress(completed, total)
+
+        return { filePath, success: true, inputTokens, outputTokens }
+      } catch (error) {
+        console.error(`Error processing ${fileName}.pdf:`, error)
+        completed++
+        onProgress(completed, total)
+
+        return { filePath, success: false, error }
+      }
+    })
+
+    // Wait for the current batch to complete before starting the next batch
+    const batchResults = await Promise.all(batchPromises)
+    results.push(...batchResults)
+  }
+
+  return results
+}
+
 /**
  * Main function using Commander to parse arguments
  */
@@ -343,7 +760,7 @@ async function main(): Promise<void> {
     .name('pdf-analyzer')
     .description('PDF analysis tool using Claude API')
     .version('1.0.0')
-    .option('-b, --batch-size <number>', 'Number of concurrent files to process', (val) => parseInt(val, 10))
+    .option('-b, --batch-size <number>', 'Number of files to process in parallel', (val) => parseInt(val, 10), 5)
 
   program
     .command('convert')
@@ -360,7 +777,7 @@ async function main(): Promise<void> {
         }
 
         console.log(`Processing PDF: ${pdfPath}`)
-        const { result: markdown } = await scheduleAnalysis(() => analyzeFile(pdfPath));
+        const { result: markdown } = await scheduleAnalysis(() => analyzeFile(pdfPath))
 
         // Save markdown to file
         await saveToFile(CONFIG.PATHS.MARKDOWN_OUTPUT, markdown)
@@ -398,7 +815,9 @@ async function main(): Promise<void> {
     .command('processFolder')
     .description('Process all PDF files in a folder')
     .argument('<folderPath>', 'path to folder containing PDF files')
-    .action(async (folderPath) => {
+    .option('-s, --sample-size <number>', 'Number of files to sample for token estimation', (val) => parseInt(val, 10))
+    .option('-b, --batch-size <number>', 'Number of files to process in parallel', (val) => parseInt(val, 10), 5)
+    .action(async (folderPath: string, options: { sampleSize?: number, batchSize?: number }) => {
       try {
         if (!fs.existsSync(folderPath)) {
           console.error(`Error: Folder not found: ${folderPath}`)
@@ -418,54 +837,91 @@ async function main(): Promise<void> {
           process.exit(0)
         }
 
-        const combinedTokenLimit = 0.8 * (CONFIG.RATE_LIMITS.INPUT_TOKENS_PER_MINUTE + CONFIG.RATE_LIMITS.OUTPUT_TOKENS_PER_MINUTE)
-        tokenLimiter.updateSettings({
-          reservoir: combinedTokenLimit,
-          reservoirRefreshAmount: combinedTokenLimit,
-          reservoirRefreshInterval: 60000
-        })
-        console.log(`Configured analysis throughput: a combined token limit of ${combinedTokenLimit} tokens per minute`)
-        console.log(`\nAnalysis will be saved to: ${analysisDir}\n`)
+        // Determine batch size for parallel processing (default 5)
+        const batchSize = options.batchSize || 5
+        console.log(`Using batch size of ${batchSize} for parallel processing`)
 
-        // Process all files concurrently using the analysisLimiter with proper token-based weighting
-        const analysisPromises = pdfFiles.map((filePath) => {
-          const fileName = path.basename(filePath, '.pdf')
-          const outputPath = path.join(analysisDir, `${fileName}.md`)
-          if (fs.existsSync(outputPath)) {
-            console.log(`Skipping: ${fileName}.md already exists.`)
-            return Promise.resolve({ filePath, success: true, skipped: true })
+        // Determine sample size - default to 10 or user-specified
+        const sampleSize = options.sampleSize ? Number(options.sampleSize) : Math.min(10, pdfFiles.length)
+        console.log(`Using sample size of ${sampleSize} files for token estimation`)
+
+        // Sample token usage to adjust our initial ratio
+        const { avgInputTokens, ratio } = await sampleTokenUsage(pdfFiles, sampleSize)
+
+        // Update our rate limiter with the sampled ratio
+        rateLimiter.addSample(avgInputTokens, Math.round(avgInputTokens * ratio))
+
+        // Track progress stats
+        let completedFiles = 0
+        let totalFiles = pdfFiles.length
+        let startTime = Date.now()
+
+        // Set up interval to display stats
+        const statsInterval = setInterval(() => {
+          rateLimiter.logStats()
+
+          if (completedFiles > 0) {
+            const elapsedSecs = (Date.now() - startTime) / 1000
+            const filesPerHour = completedFiles / elapsedSecs * 3600
+            const estimatedTimeRemaining = (totalFiles - completedFiles) / filesPerHour * 60 // minutes
+
+            console.log(`Progress: ${completedFiles}/${totalFiles} files (${(completedFiles / totalFiles * 100).toFixed(1)}%)`)
+            console.log(`Rate: ${filesPerHour.toFixed(1)} files/hour`)
+            if (!isNaN(estimatedTimeRemaining) && isFinite(estimatedTimeRemaining)) {
+              console.log(`Est. time remaining: ${estimatedTimeRemaining.toFixed(1)} minutes`)
+            } else {
+              console.log(`Est. time remaining: calculating...`)
+            }
           }
-          return scheduleAnalysis(() => analyzeFile(filePath))
-            .then(({ result: markdown, inputTokens, outputTokens }) => {
-              console.log(`Processing: ${fileName}.pdf...`)
-              return saveToFile(outputPath, markdown)
-                .then(() => {
-                  console.log(`Finished processing: ${fileName}.pdf`)
-                  return { filePath, success: true, inputTokens, outputTokens }
-                })
-                .catch((error) => {
-                  console.error(`Error processing ${fileName}.pdf:`, error)
-                  return { filePath, success: false, error }
-                })
-            })
-        })
+        }, 60000) // Show stats every minute
 
-        const analysisResults = await Promise.all(analysisPromises)
-        const successCount = analysisResults.filter(result => result.success).length
+        // Process files in parallel batches
+        console.log(`\nProcessing files in parallel batches of ${batchSize}...`)
+
+        const onProgressUpdate = (completed: number, total: number) => {
+          completedFiles = completed
+        }
+
+        const results = await processBatch(
+          pdfFiles,
+          analysisDir,
+          batchSize,
+          avgInputTokens,
+          onProgressUpdate
+        )
+
+        // Stop the stats interval
+        clearInterval(statsInterval)
+
+        // Final stats
+        const successCount = results.filter(result => result.success).length
+        const failCount = results.length - successCount
         console.log("\n=== Analysis Complete ===")
         console.log(`Successfully processed: ${successCount}/${pdfFiles.length} files`)
+        console.log(`Failed: ${failCount} files`)
         console.log(`Results saved to: ${analysisDir}`)
+
       } catch (error) {
         console.error('Error:', error)
         process.exit(1)
       }
     })
 
-  // For backward compatibility, make convert the default command
-  if (Bun.argv.length === 3 && !Bun.argv[2].startsWith('-')) {
-    program.parse(['node', 'script.js', 'convert', Bun.argv[2]])
+  // Fix for running with Bun directly
+  // When running with Bun, we need to parse all arguments including the script path
+  // Get all command line arguments except for "bun" and script path
+  const args = process.argv.slice(2)
+
+  // Check if any arguments are provided
+  if (args.length === 0) {
+    program.help()
+  } else if (args.length === 1 && args[0] && !args[0].startsWith('-')) {
+    // For backward compatibility, if only one argument and not a flag
+    // Treat it as a convert command
+    program.parse(['node', 'script.js', 'convert', args[0] || ''])
   } else {
-    program.parse()
+    // Otherwise parse normally
+    program.parse(process.argv)
   }
 }
 
