@@ -11,12 +11,12 @@ const CONFIG = {
     MARKDOWN_OUTPUT: 'out.md'
   },
   CLAUDE: {
-    MODEL: 'claude-3-5-haiku-latest',
+    MODEL: 'claude-3-7-sonnet-latest',
     MAX_TOKENS: 8192,
     TIMEOUT_MS: 300000 // 5 minute timeout
   },
   PRICING: {
-    INPUT_PER_MILLION: .8 // $0.80 per million tokens
+    INPUT_PER_MILLION: 3 // $3 per million tokens
   },
   RATE_LIMITS: {
     REQUESTS_PER_MINUTE: 4000,
@@ -368,7 +368,7 @@ const analysisPrompt = `You are a highly skilled historian and data analyst spec
 
 Please follow these steps to analyze the document:
 
-1. Read and analyze the entire document thoroughly.
+1. Read and analyze the entire document thoroughly. Produce a direct transcript of the document.
 
 2. Extract all key information, including but not limited to:
    - Dates
@@ -392,6 +392,10 @@ Please follow these steps to analyze the document:
 7. Provide a comprehensive summary of the document's contents, capturing all relevant information. Be thorough and detailed in your summary.
 
 Present your findings in the following format:
+
+<transcript>
+[Direct transcript of the document]
+</transcript>
 
 <key_information>
 [List all key information extracted from the document]
@@ -817,7 +821,8 @@ async function main(): Promise<void> {
     .argument('<folderPath>', 'path to folder containing PDF files')
     .option('-s, --sample-size <number>', 'Number of files to sample for token estimation', (val) => parseInt(val, 10))
     .option('-b, --batch-size <number>', 'Number of files to process in parallel', (val) => parseInt(val, 10), 5)
-    .action(async (folderPath: string, options: { sampleSize?: number, batchSize?: number }) => {
+    .option('-y, --yes', 'Skip confirmation and proceed with processing')
+    .action(async (folderPath: string, options: { sampleSize?: number, batchSize?: number, yes?: boolean }) => {
       try {
         if (!fs.existsSync(folderPath)) {
           console.error(`Error: Folder not found: ${folderPath}`)
@@ -850,6 +855,24 @@ async function main(): Promise<void> {
 
         // Update our rate limiter with the sampled ratio
         rateLimiter.addSample(avgInputTokens, Math.round(avgInputTokens * ratio))
+
+        // Calculate total estimated cost
+        const totalTokens = avgInputTokens * pdfFiles.length
+        const estimatedCost = (totalTokens / 1000000) * CONFIG.PRICING.INPUT_PER_MILLION
+
+        console.log(`\nEstimated token usage for ${pdfFiles.length} files:`)
+        console.log(`- Input tokens per file (avg): ${avgInputTokens.toLocaleString()}`)
+        console.log(`- Total input tokens: ${totalTokens.toLocaleString()}`)
+        console.log(`- Estimated cost: $${estimatedCost.toFixed(2)} (at $${CONFIG.PRICING.INPUT_PER_MILLION} per million tokens)`)
+
+        // Confirm with user unless --yes flag is provided
+        if (!options.yes) {
+          const proceed = await askForConfirmation('\nDo you want to proceed with processing these files? (y/n): ')
+          if (!proceed) {
+            console.log('Operation cancelled by user.')
+            process.exit(0)
+          }
+        }
 
         // Track progress stats
         let completedFiles = 0
